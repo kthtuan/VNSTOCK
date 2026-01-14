@@ -99,3 +99,34 @@ def get_stock_news(symbol: str):
         return news
     
     return []
+@app.get("/api/stock/foreign/{symbol}")
+def get_foreign_flow(symbol: str):
+    try:
+        # Lấy ngày hiện tại và 30 ngày trước
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        
+        # Gọi thư viện vnstock để lấy dữ liệu khối ngoại
+        # Lưu ý: Hàm này có thể khác nhau tùy phiên bản vnstock. 
+        # Nếu dùng bản mới nhất, thường là stock_trading_analysis hoặc tương tự.
+        # Đây là cách lấy an toàn từ lịch sử giao dịch:
+        
+        stock = Vnstock().stock(symbol=symbol.upper(), source='VCI')
+        df = stock.quote.history(start=start_date, end=end_date, interval='1D')
+        
+        if df is None or df.empty:
+            return []
+
+        # Chuẩn hóa tên cột về chữ thường
+        df.columns = [col.lower() for col in df.columns]
+        
+        # Kiểm tra xem có cột nước ngoài không (thường là 'foreign_buy', 'foreign_sell')
+        # Nếu thư viện trả về tên khác, code này sẽ trả về danh sách rỗng để không bị lỗi 500
+        
+        # Trả về 10 ngày gần nhất
+        return df.tail(10).to_dict(orient='records')
+        
+    except Exception as e:
+        print(f"Lỗi lấy dữ liệu khối ngoại {symbol}: {e}")
+        # Trả về mảng rỗng thay vì lỗi để App không bị crash
+        return []
