@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from vnstock import Vnstock
 import pandas as pd
-from vnstock import stock_trading_analysis
+from vnstock import stock_historical_data
 from datetime import datetime, timedelta
 import feedparser
 import urllib.parse
@@ -141,3 +141,4 @@ def get_foreign_flow(symbol: str):
     except Exception as e:
         print(f"Lỗi khối ngoại {symbol}: {e}")
         return []
+
