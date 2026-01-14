@@ -2,3 +2,5 @@ fastapi
 uvicorn
 vnstock
 pandas
+feedparser
+requests
