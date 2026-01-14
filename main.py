@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-# Import cả 2 class để dùng linh hoạt
+# Import thư viện
 from vnstock import Vnstock, Quote 
 import pandas as pd
 from datetime import datetime, timedelta
@@ -9,7 +9,6 @@ import urllib.parse
 
 app = FastAPI()
 
-# Cấu hình CORS (Cho phép Frontend React gọi API)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,93 +17,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. ROOT API (GIỮ LẠI ĐỂ TEST SERVER) ---
 @app.get("/")
 def home():
-    return {"message": "Stock API (Google News Gateway) is running!"}
+    return {"message": "Stock API is running!"}
 
-# --- HÀM HỖ TRỢ: LẤY DỮ LIỆU AN TOÀN (Auto Switch Source) ---
-# Hàm này giúp tự động đổi nguồn TCBS -> DNSE -> VCI nếu bị lỗi
+# --- HÀM THÔNG MINH: TỰ ĐỘNG ĐỔI NGUỒN (Đã thêm SSI) ---
 def get_stock_data_safe(symbol: str, start_date: str, end_date: str):
-    # Ưu tiên 1: TCBS (Dữ liệu xịn, có khối ngoại)
+    # 1. Thử TCBS (Ưu tiên số 1: Dữ liệu xịn nhất)
     try:
         quote = Quote(symbol=symbol, start=start_date, end=end_date, source='TCBS')
         df = quote.history()
         if df is not None and not df.empty:
+            print(f"Lấy từ TCBS thành công: {symbol}")
             return df
     except:
-        print(f"TCBS lỗi với {symbol}, thử DNSE...")
+        pass # Lặng lẽ bỏ qua để thử nguồn khác
 
-    # Ưu tiên 2: DNSE (Ít bị chặn IP)
+    # 2. Thử SSI (Ưu tiên số 2: Có khối ngoại, ít bị chặn hơn TCBS)
+    try:
+        quote = Quote(symbol=symbol, start=start_date, end=end_date, source='SSI')
+        df = quote.history()
+        if df is not None and not df.empty:
+            print(f"Lấy từ SSI thành công: {symbol}")
+            return df
+    except:
+        pass
+
+    # 3. Thử DNSE
     try:
         quote = Quote(symbol=symbol, start=start_date, end=end_date, source='DNSE')
         df = quote.history()
         if df is not None and not df.empty:
+            print(f"Lấy từ DNSE thành công: {symbol}")
             return df
     except:
-        print(f"DNSE lỗi với {symbol}, thử VCI...")
+        pass
 
-    # Ưu tiên 3: VCI (Cơ bản nhất)
+    # 4. Đường cùng: VCI (Chỉ có giá, không có khối ngoại)
     try:
         stock = Vnstock().stock(symbol=symbol, source='VCI')
         df = stock.quote.history(start=start_date, end=end_date, interval='1D')
         if df is not None and not df.empty:
+            print(f"Fallback về VCI (Không có khối ngoại): {symbol}")
             return df
     except Exception as e:
         print(f"Thất bại toàn tập với {symbol}: {e}")
     
     return None
 
-# --- 2. API LẤY GIÁ CỔ PHIẾU ---
+# --- API LẤY GIÁ ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
         end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d') # Lấy 3 năm
+        start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
         
-        # Gọi hàm an toàn
         df = get_stock_data_safe(symbol.upper(), start_date, end_date)
-
         if df is None or df.empty: return []
 
-        # Chuẩn hóa tên cột
         df.columns = [col.lower() for col in df.columns]
         
-        # Xử lý cột ngày tháng
-        if 'time' in df.columns: 
-            df['date'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
-        elif 'tradingdate' in df.columns: 
-            df['date'] = pd.to_datetime(df['tradingdate']).dt.strftime('%Y-%m-%d')
+        # Xử lý ngày tháng
+        if 'time' in df.columns: df['date'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
+        elif 'tradingdate' in df.columns: df['date'] = pd.to_datetime(df['tradingdate']).dt.strftime('%Y-%m-%d')
             
-        # Xử lý lỗi đơn vị giá (một số nguồn trả về 40 thay vì 40000)
+        # Fix lỗi giá x1000
         if 'close' in df.columns and df['close'].iloc[-1] < 500:
              for c in ['open', 'high', 'low', 'close']: 
                  if c in df.columns: df[c] = df[c] * 1000
 
-        # Chỉ trả về các cột cần thiết
-        return df[['date', 'open', 'high', 'low', 'close', 'volume']].to_dict(orient='records')
+        # Trả về các cột cơ bản
+        cols = ['date', 'open', 'high', 'low', 'close', 'volume']
+        return df[[c for c in cols if c in df.columns]].to_dict(orient='records')
     except Exception as e:
         print(f"Stock Error: {e}")
         return []
 
-# --- 3. API LẤY TIN TỨC (GOOGLE NEWS) ---
+# --- API TIN TỨC (Google News) ---
 @app.get("/api/news/{symbol}")
 def get_stock_news(symbol: str):
     try:
-        query = f'"{symbol}" AND (site:cafef.vn OR site:vietstock.vn OR site:tinnhanhchungkhoan.vn)'
+        query = f'"{symbol}" AND (site:cafef.vn OR site:vietstock.vn)'
         encoded_query = urllib.parse.quote(query)
         rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=vi&gl=VN&ceid=VN:vi"
-        
         feed = feedparser.parse(rss_url)
-        news_list = []
         
+        news_list = []
         for entry in feed.entries[:10]:
-            published_parsed = entry.get("published_parsed")
-            if published_parsed:
-                date_str = f"{published_parsed.tm_year}-{published_parsed.tm_mon:02d}-{published_parsed.tm_mday:02d}"
-            else:
-                date_str = datetime.now().strftime('%Y-%m-%d')
-
+            try:
+                dt = entry.published_parsed
+                date_str = f"{dt.tm_year}-{dt.tm_mon:02d}-{dt.tm_mday:02d}" if dt else ""
+            except: date_str = ""
+            
             news_list.append({
                 "title": entry.title,
                 "link": entry.link,
@@ -112,33 +116,39 @@ def get_stock_news(symbol: str):
                 "source": "Google News"
             })
         return news_list
-    except Exception as e:
-        print(f"News Error: {e}")
-        return []
+    except: return []
 
-# --- 4. API LẤY KHỐI NGOẠI ---
+# --- API KHỐI NGOẠI (Cập nhật logic lấy nhiều tên cột) ---
 @app.get("/api/stock/foreign/{symbol}")
 def get_foreign_flow(symbol: str):
     try:
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         
-        # Gọi hàm an toàn để lấy dữ liệu
         df = get_stock_data_safe(symbol.upper(), start_date, end_date)
-        
         if df is None or df.empty: return []
 
         results = []
         for index, row in df.iterrows():
-            # Logic map dữ liệu an toàn cho các nguồn khác nhau
-            buy = float(row.get('foreign_buy', row.get('nn_mua', 0)) or 0)
-            sell = float(row.get('foreign_sell', row.get('nn_ban', 0)) or 0)
+            # 1. Cố gắng lấy Mua/Bán (TCBS/SSI hay dùng tên khác nhau)
+            buy = 0.0
+            sell = 0.0
+            
+            # Các biến thể tên cột mua
+            for col in ['foreign_buy', 'nn_mua', 'buy_foreign_qtty', 'buy_total_qtty']:
+                if col in row and row[col]: buy = float(row[col]); break
+            
+            # Các biến thể tên cột bán
+            for col in ['foreign_sell', 'nn_ban', 'sell_foreign_qtty', 'sell_total_qtty']:
+                if col in row and row[col]: sell = float(row[col]); break
             
             # Tính ròng
             net = buy - sell
-            # Fallback nếu không có buy/sell mà chỉ có net
+            
+            # Nếu vẫn bằng 0, thử tìm cột Net trực tiếp
             if net == 0:
-                net = float(row.get('khoi_luong_rong', row.get('net_value', 0)) or 0)
+                for col in ['khoi_luong_rong', 'net_value', 'net_foreign_vol']:
+                    if col in row and row[col]: net = float(row[col]); break
 
             results.append({
                 "date": str(row.get('time', row.get('ngay', row.get('date', '')))),
