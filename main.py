@@ -1,13 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from vnstock import Vnstock, stock_trading_analysis
+# Import cả 2 class để dùng linh hoạt
+from vnstock import Vnstock, Quote 
 import pandas as pd
 from datetime import datetime, timedelta
 import feedparser
 import urllib.parse
+import numpy as np # Thêm numpy để xử lý số liệu an toàn hơn
 
 app = FastAPI()
 
+# Cấu hình CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,133 +21,190 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"message": "Stock API (Google News Gateway) is running!"}
+    return {"message": "Stock API is running (Shark Analysis + Smart Fallback)"}
 
-# --- 1. API LẤY GIÁ (GIỮ NGUYÊN) ---
+# --- 1. HÀM HELPER: LẤY DỮ LIỆU AN TOÀN (Thử nhiều nguồn) ---
+def get_stock_data_safe(symbol: str, start_date: str, end_date: str):
+    # Ưu tiên 1: TCBS (Dữ liệu đầy đủ nhất)
+    try:
+        quote = Quote(symbol=symbol, start=start_date, end=end_date, source='TCBS')
+        df = quote.history()
+        if df is not None and not df.empty: return df
+    except: pass
+
+    # Ưu tiên 2: SSI (Thường có khối ngoại, ít chặn hơn TCBS)
+    try:
+        quote = Quote(symbol=symbol, start=start_date, end=end_date, source='SSI')
+        df = quote.history()
+        if df is not None and not df.empty: return df
+    except: pass
+
+    # Ưu tiên 3: DNSE (Dự phòng)
+    try:
+        quote = Quote(symbol=symbol, start=start_date, end=end_date, source='DNSE')
+        df = quote.history()
+        if df is not None and not df.empty: return df
+    except: pass
+
+    # Ưu tiên 4: VCI (Đường cùng - Chỉ có Giá, không có Khối ngoại)
+    try:
+        stock = Vnstock().stock(symbol=symbol, source='VCI')
+        df = stock.quote.history(start=start_date, end=end_date, interval='1D')
+        if df is not None and not df.empty: return df
+    except Exception as e:
+        print(f"Lỗi lấy dữ liệu {symbol}: {e}")
+    
+    return None
+
+# --- 2. API STOCK (TÍCH HỢP PHÂN TÍCH CÁ MẬP VSA) ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
-        # Cố gắng lấy data, chấp nhận rủi ro bị chặn IP ở phần này
-        # Nếu bị chặn nốt thì phải dùng giải pháp khác, nhưng thường API giá mở hơn API tin
         end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
         
-        try:
-            stock = Vnstock().stock(symbol=symbol.upper(), source='VCI')
-            df = stock.quote.history(start=start_date, end=end_date, interval='1D')
-        except:
-            stock = Vnstock().stock(symbol=symbol.upper(), source='TCBS')
-            df = stock.quote.history(start=start_date, end=end_date, interval='1D')
+        # Gọi hàm lấy dữ liệu an toàn
+        df = get_stock_data_safe(symbol.upper(), start_date, end_date)
 
         if df is None or df.empty: return []
 
+        # Chuẩn hóa tên cột
         df.columns = [col.lower() for col in df.columns]
+        
+        # Xử lý ngày tháng
         if 'time' in df.columns: df['date'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
         elif 'tradingdate' in df.columns: df['date'] = pd.to_datetime(df['tradingdate']).dt.strftime('%Y-%m-%d')
             
-        if df['close'].iloc[-1] < 500:
+        # Fix lỗi đơn vị giá (nếu có)
+        if 'close' in df.columns and df['close'].iloc[-1] < 500:
              for c in ['open', 'high', 'low', 'close']: 
                  if c in df.columns: df[c] = df[c] * 1000
 
-        return df[['date', 'open', 'high', 'low', 'close', 'volume']].to_dict(orient='records')
+        # === PHÂN TÍCH CÁ MẬP (VSA LOGIC) ===
+        # Tính MA20 của Volume
+        df['ma20_vol'] = df['volume'].rolling(window=20).mean()
+        
+        # Lấy dữ liệu mới nhất
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2] if len(df) > 1 else last_row
+        
+        vol_current = last_row['volume']
+        vol_avg = last_row.get('ma20_vol', vol_current) # Nếu không có MA20 thì lấy vol hiện tại
+        
+        # Xử lý chia cho 0
+        if pd.isna(vol_avg) or vol_avg == 0: vol_avg = 1
+            
+        price_change_pct = (last_row['close'] - prev_row['close']) / prev_row['close'] * 100
+        vol_ratio = vol_current / vol_avg
+
+        # Logic VSA đơn giản hóa (Gom hàng/Xả hàng)
+        shark_action = "Lưỡng lự"
+        shark_color = "neutral" # neutral, buy, sell
+
+        if vol_ratio > 1.2: # Vol nổ (Lớn hơn 1.2 lần trung bình)
+            if price_change_pct > 1.0:
+                shark_action = "Gom hàng mạnh"
+                shark_color = "buy"
+            elif price_change_pct < -1.0:
+                shark_action = "Xả hàng mạnh"
+                shark_color = "sell"
+            else:
+                shark_action = "Biến động mạnh"
+                shark_color = "warning"
+        else: # Vol thấp
+            if price_change_pct > 2: shark_action = "Kéo giá (Tiết cung)"
+            elif price_change_pct < -2: shark_action = "Đè giá (Cạn vol)"
+            else: shark_action = "Tích lũy"
+
+        # === TRẢ VỀ KẾT QUẢ ===
+        # Quan trọng: Frontend cần cập nhật để đọc được cấu trúc shark_analysis này
+        return {
+            "data": df[['date', 'open', 'high', 'low', 'close', 'volume']].to_dict(orient='records'),
+            "shark_analysis": {
+                "action": shark_action,
+                "color": shark_color,
+                "vol_ratio": round(vol_ratio, 2)
+            }
+        }
+
     except Exception as e:
         print(f"Stock Error: {e}")
         return []
 
-# --- 2. HÀM LẤY TIN QUA GOOGLE NEWS RSS (KHÔNG LO CHẶN IP) ---
-def get_google_stock_news(symbol):
+# --- 3. API KHỐI NGOẠI (THỬ NHIỀU NGUỒN & MAP CỘT) ---
+@app.get("/api/stock/foreign/{symbol}")
+def get_foreign_flow(symbol: str):
     try:
-        # Tạo câu truy vấn: "Mã CK" site:cafef.vn OR site:vietstock.vn ...
-        # Chỉ lấy tin từ các trang uy tín để tránh rác
-        query = f'"{symbol}" AND (site:cafef.vn OR site:vietstock.vn OR site:tinnhanhchungkhoan.vn)'
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        
+        # Gọi hàm lấy dữ liệu an toàn
+        df = get_stock_data_safe(symbol.upper(), start_date, end_date)
+        
+        if df is None or df.empty: return []
+
+        results = []
+        for index, row in df.iterrows():
+            buy = 0.0
+            sell = 0.0
+            
+            # Map tên cột từ nhiều nguồn khác nhau (TCBS/SSI/DNSE đều đặt tên khác nhau)
+            # 1. Tìm cột Mua
+            for col in ['foreign_buy', 'nn_mua', 'buy_foreign_qtty', 'buy_total_qtty']:
+                if col in row and pd.notna(row[col]): 
+                    buy = float(row[col])
+                    break
+            
+            # 2. Tìm cột Bán
+            for col in ['foreign_sell', 'nn_ban', 'sell_foreign_qtty', 'sell_total_qtty']:
+                if col in row and pd.notna(row[col]): 
+                    sell = float(row[col])
+                    break
+            
+            net = buy - sell
+            
+            # 3. Nếu Net = 0, thử tìm cột Net trực tiếp (Fallback)
+            if net == 0:
+                 for col in ['khoi_luong_rong', 'net_value', 'net_foreign_vol']:
+                    if col in row and pd.notna(row[col]): 
+                        net = float(row[col])
+                        break
+
+            results.append({
+                "date": str(row.get('time', row.get('ngay', row.get('date', '')))),
+                "buyVol": buy,
+                "sellVol": sell,
+                "netVolume": net
+            })
+            
+        return results
+    except Exception as e:
+        print(f"Foreign Error {symbol}: {e}")
+        return []
+
+# --- 4. API TIN TỨC (GIỮ NGUYÊN) ---
+@app.get("/api/news/{symbol}")
+def get_stock_news(symbol: str):
+    try:
+        query = f'"{symbol}" AND (site:cafef.vn OR site:vietstock.vn)'
         encoded_query = urllib.parse.quote(query)
-        
-        # URL RSS của Google News tiếng Việt
         rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=vi&gl=VN&ceid=VN:vi"
-        
-        # Đọc RSS
         feed = feedparser.parse(rss_url)
         
         news_list = []
-        for entry in feed.entries[:10]: # Lấy 10 tin đầu
-            # Xử lý ngày tháng (Google trả về format phức tạp, ta lấy đơn giản)
+        for entry in feed.entries[:10]:
             published_parsed = entry.get("published_parsed")
-            if published_parsed:
-                date_str = f"{published_parsed.tm_year}-{published_parsed.tm_mon:02d}-{published_parsed.tm_mday:02d}"
-            else:
-                date_str = datetime.now().strftime('%Y-%m-%d')
-
+            date_str = f"{published_parsed.tm_year}-{published_parsed.tm_mon:02d}-{published_parsed.tm_mday:02d}" if published_parsed else ""
+            
             news_list.append({
                 "title": entry.title,
                 "link": entry.link,
                 "publishdate": date_str,
-                "source": "Google News (Aggregated)"
+                "source": "Google News"
             })
-            
         return news_list
-    except Exception as e:
-        print(f"Google RSS Error: {e}")
-        return []
+    except: return []
 
-# --- 3. API TỔNG HỢP ---
-@app.get("/api/news/{symbol}")
-def get_stock_news(symbol: str):
-    print(f"Đang lấy tin cho {symbol} qua Google News...")
-    
-    # Chỉ dùng duy nhất Google News vì nó ổn định nhất trên Cloud nước ngoài
-    news = get_google_stock_news(symbol)
-    
-    if news:
-        print(f"=> Lấy được {len(news)} tin.")
-        return news
-    
-    return []
-@app.get("/api/stock/foreign/{symbol}")
-def get_foreign_flow(symbol: str):
-    try:
-        # 1. Tính ngày: Lấy dữ liệu 30 ngày gần nhất
-        end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-        
-        # 2. GỌI HÀM CHUẨN: stock_trading_analysis
-        # source='TCBS' thường cung cấp đầy đủ dữ liệu khối ngoại nhất
-        df = stock_trading_analysis(symbol=symbol.upper(), start_date=start_date, end_date=end_date, source='TCBS')
-        
-        if df is None or df.empty:
-            return []
-
-        # 3. Xử lý tên cột (Do TCBS trả về tiếng Việt hoặc tên khác)
-        # TCBS thường trả về: 'mua_rong_khop_lenh', 'nam_giu_khop_lenh'...
-        # Ta cần map nó về format mà App Frontend đang hiểu (buyVol, sellVol...)
-        
-        # In thử tên cột để debug nếu cần
-        # print(df.columns) 
-        
-        # Tạo danh sách kết quả chuẩn hóa
-        results = []
-        for index, row in df.iterrows():
-            # Lưu ý: Tùy version vnstock, tên cột có thể là 'investor_date', 'net_foreign_value'...
-            # Dưới đây là cách map an toàn nhất dựa trên logic dữ liệu TCBS
-            
-            # Giả sử vnstock trả về các cột phổ biến. 
-            # Nếu dùng stock_trading_analysis của TCBS, nó thường trả về số liệu Mua Ròng (Net Buy)
-            
-            # Logic an toàn: Lấy giá trị Mua Ròng (Net Value)
-            # Nếu vnstock trả về cột 'color', 'net_value', 'date'...
-            
-            results.append({
-                "date": row.get('time', row.get('ngay', '')), # Lấy ngày
-                "netVolume": row.get('khoi_luong_rong', row.get('net_value', 0)), # Khối lượng/Giá trị ròng
-                # Nếu không có số liệu mua/bán riêng, ta tạm để 0 hoặc ước lượng
-                "buyVolume": 0, 
-                "sellVolume": 0
-            })
-            
-        # NẾU CÁCH TRÊN PHỨC TẠP, HÃY DÙNG CÁCH ĐƠN GIẢN HÓA NÀY CHO NGƯỜI MỚI:
-        # Trả về nguyên dataframe dạng records, Frontend sẽ tự tìm key
-        return df.tail(15).to_dict(orient='records')
-
-    except Exception as e:
-        print(f"Lỗi khối ngoại {symbol}: {e}")
-        return []
-
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
