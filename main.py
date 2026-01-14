@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from vnstock import Vnstock
 import pandas as pd
-from vnstock import stock_historical_data
+from vnstock import stock_historical_data, stock_quote
 from datetime import datetime, timedelta
 import feedparser
 import urllib.parse
@@ -103,42 +103,35 @@ def get_stock_news(symbol: str):
 @app.get("/api/stock/foreign/{symbol}")
 def get_foreign_flow(symbol: str):
     try:
-        # Lấy dữ liệu 30 ngày gần nhất
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         
-        # Dùng hàm stock_historical_data với nguồn TCBS (có dữ liệu khối ngoại)
-        df = stock_historical_data(symbol=symbol.upper(), start_date=start_date, end_date=end_date, resolution='1D', type='stock', source='TCBS')
+        # 1. Dùng nguồn TCBS (Nguồn này trả về đủ cột nước ngoài)
+        stock = Vnstock().stock(symbol=symbol.upper(), source='TCBS')
+        df = stock.quote.history(start=start_date, end=end_date, interval='1D')
         
-        if df is None or df.empty:
-            return []
+        if df is None or df.empty: return []
 
-        # Chuẩn hóa dữ liệu trả về
         results = []
         for index, row in df.iterrows():
-            # TCBS thường trả về cột 'foreign_buy', 'foreign_sell'
-            # Dùng .get() để an toàn, nếu không có thì mặc định là 0
+            # TCBS trả về cột 'foreign_buy' và 'foreign_sell' (hoặc nn_mua/nn_ban)
+            # Dùng .get() để lấy an toàn
+            buy = float(row.get('foreign_buy', row.get('nn_mua', 0)) or 0)
+            sell = float(row.get('foreign_sell', row.get('nn_ban', 0)) or 0)
             
-            # Lấy giá trị mua/bán (ép kiểu float để tránh lỗi)
-            buy_vol = float(row.get('foreign_buy', row.get('nn_mua', 0)) or 0)
-            sell_vol = float(row.get('foreign_sell', row.get('nn_ban', 0)) or 0)
-            
-            # Tính mua ròng
-            net_vol = buy_vol - sell_vol
+            # Tính ròng
+            net = buy - sell
             
             results.append({
-                # Lấy ngày (ưu tiên các tên cột phổ biến)
                 "date": str(row.get('time', row.get('ngay', row.get('date', '')))),
-                "buyVol": buy_vol,
-                "sellVol": sell_vol,
-                "netVolume": net_vol
+                "buyVol": buy,
+                "sellVol": sell,
+                "netVolume": net
             })
             
-        # Đảo ngược mảng để ngày mới nhất nằm cuối (nếu cần) hoặc giữ nguyên tùy chart
-        # Thường chart cần data từ cũ -> mới
         return results
-
     except Exception as e:
-        print(f"Lỗi khối ngoại {symbol}: {e}")
+        print(f"Foreign Error {symbol}: {e}")
         return []
+
 
