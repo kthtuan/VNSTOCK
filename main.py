@@ -62,22 +62,42 @@ def get_stock(symbol: str):
     except Exception as e:
         print(f"Error: {e}")
         return []
-# --- API LẤY TIN TỨC MỚI ---
+# --- API LẤY TIN TỨC (CÓ DỰ PHÒNG) ---
 @app.get("/api/news/{symbol}")
 def get_stock_news(symbol: str):
     try:
-        # Dùng nguồn TCBS để lấy tin tức (VCI thường ít tin hơn)
-        stock = Vnstock().stock(symbol=symbol.upper(), source='TCBS')
-        df = stock.news()
-        
+        # CHIẾN THUẬT 1: Thử nguồn TCBS trước (Thường nhiều tin nhất)
+        try:
+            stock = Vnstock().stock(symbol=symbol.upper(), source='TCBS')
+            df = stock.news()
+        except:
+            df = None
+
+        # CHIẾN THUẬT 2: Nếu TCBS rỗng hoặc lỗi -> Thử nguồn VCI (Vietcap)
+        if df is None or df.empty:
+            print(f"⚠️ TCBS không có tin cho {symbol}, đang chuyển sang VCI...")
+            try:
+                stock = Vnstock().stock(symbol=symbol.upper(), source='VCI')
+                df = stock.news()
+            except:
+                pass
+
+        # XỬ LÝ DỮ LIỆU TRẢ VỀ
         if df is not None and not df.empty:
-            # Chuẩn hóa tên cột
+            # Chuẩn hóa tên cột về chữ thường
             df.columns = [c.lower() for c in df.columns]
+            
+            # Đảm bảo có cột 'title' và 'publishdate'
+            # (VCI có thể trả tên cột khác TCBS một chút, ta map lại cho chắc)
+            if 'title' not in df.columns and 'tieude' in df.columns:
+                df['title'] = df['tieude']
+            if 'publishdate' not in df.columns and 'ngaydang' in df.columns:
+                df['publishdate'] = df['ngaydang']
             
             # Chỉ lấy 10 tin mới nhất
             return df.head(10).to_dict(orient='records')
             
-        return []
+        return [] # Vẫn rỗng thì chịu thua
     except Exception as e:
         print(f"❌ Lỗi lấy tin tức: {e}")
         return []
