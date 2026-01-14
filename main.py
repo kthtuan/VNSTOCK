@@ -103,49 +103,42 @@ def get_stock_news(symbol: str):
 @app.get("/api/stock/foreign/{symbol}")
 def get_foreign_flow(symbol: str):
     try:
-        # 1. Tính ngày: Lấy dữ liệu 30 ngày gần nhất
+        # Lấy dữ liệu 30 ngày gần nhất
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         
-        # 2. GỌI HÀM CHUẨN: stock_trading_analysis
-        # source='TCBS' thường cung cấp đầy đủ dữ liệu khối ngoại nhất
-        df = stock_trading_analysis(symbol=symbol.upper(), start_date=start_date, end_date=end_date, source='TCBS')
+        # Dùng hàm stock_historical_data (An toàn, bản nào cũng có)
+        # source='TCBS' thường có đủ dữ liệu khối ngoại
+        df = stock_historical_data(symbol=symbol.upper(), start_date=start_date, end_date=end_date, source='TCBS')
         
         if df is None or df.empty:
             return []
 
-        # 3. Xử lý tên cột (Do TCBS trả về tiếng Việt hoặc tên khác)
-        # TCBS thường trả về: 'mua_rong_khop_lenh', 'nam_giu_khop_lenh'...
-        # Ta cần map nó về format mà App Frontend đang hiểu (buyVol, sellVol...)
-        
-        # In thử tên cột để debug nếu cần
-        # print(df.columns) 
-        
-        # Tạo danh sách kết quả chuẩn hóa
+        # Xử lý dữ liệu trả về
         results = []
         for index, row in df.iterrows():
-            # Lưu ý: Tùy version vnstock, tên cột có thể là 'investor_date', 'net_foreign_value'...
-            # Dưới đây là cách map an toàn nhất dựa trên logic dữ liệu TCBS
+            # TCBS/Vnstock trả về các cột liên quan khối ngoại
+            # Dùng .get() để tránh lỗi nếu tên cột thay đổi
+            buy_vol = row.get('foreign_buy', row.get('nn_mua', 0))
+            sell_vol = row.get('foreign_sell', row.get('nn_ban', 0))
             
-            # Giả sử vnstock trả về các cột phổ biến. 
-            # Nếu dùng stock_trading_analysis của TCBS, nó thường trả về số liệu Mua Ròng (Net Buy)
+            # Nếu dữ liệu trả về là None thì gán bằng 0
+            if buy_vol is None: buy_vol = 0
+            if sell_vol is None: sell_vol = 0
             
-            # Logic an toàn: Lấy giá trị Mua Ròng (Net Value)
-            # Nếu vnstock trả về cột 'color', 'net_value', 'date'...
+            # Tính mua ròng
+            net_vol = float(buy_vol) - float(sell_vol)
             
             results.append({
-                "date": row.get('time', row.get('ngay', '')), # Lấy ngày
-                "netVolume": row.get('khoi_luong_rong', row.get('net_value', 0)), # Khối lượng/Giá trị ròng
-                # Nếu không có số liệu mua/bán riêng, ta tạm để 0 hoặc ước lượng
-                "buyVolume": 0, 
-                "sellVolume": 0
+                "date": str(row.get('time', row.get('ngay', row.get('date', '')))),
+                "buyVol": float(buy_vol),
+                "sellVol": float(sell_vol),
+                "netVolume": net_vol
             })
             
-        # NẾU CÁCH TRÊN PHỨC TẠP, HÃY DÙNG CÁCH ĐƠN GIẢN HÓA NÀY CHO NGƯỜI MỚI:
-        # Trả về nguyên dataframe dạng records, Frontend sẽ tự tìm key
-        return df.tail(15).to_dict(orient='records')
+        # Đảo ngược để ngày mới nhất nằm cuối (cho biểu đồ vẽ đúng chiều)
+        return results
 
     except Exception as e:
         print(f"Lỗi khối ngoại {symbol}: {e}")
         return []
-
