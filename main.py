@@ -3,7 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from vnstock import Vnstock
 import pandas as pd
 from datetime import datetime, timedelta
-import requests
+import feedparser
+import urllib.parse
 
 app = FastAPI()
 
@@ -17,12 +18,14 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"message": "Stock API with VNDirect Source is running!"}
+    return {"message": "Stock API (Google News Gateway) is running!"}
 
 # --- 1. API LẤY GIÁ (GIỮ NGUYÊN) ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
+        # Cố gắng lấy data, chấp nhận rủi ro bị chặn IP ở phần này
+        # Nếu bị chặn nốt thì phải dùng giải pháp khác, nhưng thường API giá mở hơn API tin
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
         
@@ -48,67 +51,51 @@ def get_stock(symbol: str):
         print(f"Stock Error: {e}")
         return []
 
-# --- 2. HÀM LẤY TIN TỪ VNDIRECT (JSON API - CỰC ỔN ĐỊNH) ---
-def get_vndirect_news(symbol):
+# --- 2. HÀM LẤY TIN QUA GOOGLE NEWS RSS (KHÔNG LO CHẶN IP) ---
+def get_google_stock_news(symbol):
     try:
-        # API công khai của VNDirect (trả về JSON, không cần parse HTML)
-        url = "https://finfo-api.vndirect.com.vn/v4/news"
-        params = {
-            "symbol": symbol.upper(),
-            "pageSize": 10,
-            "page": 1
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
+        # Tạo câu truy vấn: "Mã CK" site:cafef.vn OR site:vietstock.vn ...
+        # Chỉ lấy tin từ các trang uy tín để tránh rác
+        query = f'"{symbol}" AND (site:cafef.vn OR site:vietstock.vn OR site:tinnhanhchungkhoan.vn)'
+        encoded_query = urllib.parse.quote(query)
         
-        response = requests.get(url, params=params, headers=headers, timeout=10)
+        # URL RSS của Google News tiếng Việt
+        rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=vi&gl=VN&ceid=VN:vi"
         
-        if response.status_code == 200:
-            data = response.json()
-            if 'data' in data and len(data['data']) > 0:
-                news_list = []
-                for item in data['data']:
-                    # Tạo link tin tức (VNDirect News)
-                    news_id = item.get('newsId')
-                    # Format link: https://dautu.vndirect.com.vn/tin-tuc/tieu-de-slug-{newsId}
-                    # Để đơn giản ta dẫn về trang news chung hoặc tạo link giả lập
-                    article_link = f"https://dautu.vndirect.com.vn/tin-tuc/chi-tiet-{news_id}"
-                    
-                    news_list.append({
-                        "title": item.get('newsTitle'),
-                        "publishdate": item.get('newsDate', '').split('T')[0], # Lấy phần ngày YYYY-MM-DD
-                        "link": article_link,
-                        "source": "VNDirect"
-                    })
-                return news_list
-        return []
+        # Đọc RSS
+        feed = feedparser.parse(rss_url)
+        
+        news_list = []
+        for entry in feed.entries[:10]: # Lấy 10 tin đầu
+            # Xử lý ngày tháng (Google trả về format phức tạp, ta lấy đơn giản)
+            published_parsed = entry.get("published_parsed")
+            if published_parsed:
+                date_str = f"{published_parsed.tm_year}-{published_parsed.tm_mon:02d}-{published_parsed.tm_mday:02d}"
+            else:
+                date_str = datetime.now().strftime('%Y-%m-%d')
+
+            news_list.append({
+                "title": entry.title,
+                "link": entry.link,
+                "publishdate": date_str,
+                "source": "Google News (Aggregated)"
+            })
+            
+        return news_list
     except Exception as e:
-        print(f"VNDirect Error: {e}")
+        print(f"Google RSS Error: {e}")
         return []
 
 # --- 3. API TỔNG HỢP ---
 @app.get("/api/news/{symbol}")
 def get_stock_news(symbol: str):
-    print(f"Đang lấy tin cho {symbol}...")
+    print(f"Đang lấy tin cho {symbol} qua Google News...")
     
-    # Ưu tiên 1: TCBS (Vnstock)
-    try:
-        stock = Vnstock().stock(symbol=symbol.upper(), source='TCBS')
-        df = stock.news()
-        if df is not None and not df.empty:
-            print("=> Lấy từ TCBS thành công")
-            df.columns = [c.lower() for c in df.columns]
-            return df.head(10).to_dict(orient='records')
-    except:
-        pass
-        
-    # Ưu tiên 2: VNDirect API (Dự phòng xịn)
-    print("=> TCBS rỗng, chuyển sang VNDirect API...")
-    vndirect_data = get_vndirect_news(symbol)
+    # Chỉ dùng duy nhất Google News vì nó ổn định nhất trên Cloud nước ngoài
+    news = get_google_stock_news(symbol)
     
-    if vndirect_data:
-        print(f"=> Lấy được {len(vndirect_data)} tin từ VNDirect")
-        return vndirect_data
-        
+    if news:
+        print(f"=> Lấy được {len(news)} tin.")
+        return news
+    
     return []
