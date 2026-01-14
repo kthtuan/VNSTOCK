@@ -107,36 +107,35 @@ def get_foreign_flow(symbol: str):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         
-        # Dùng hàm stock_historical_data (An toàn, bản nào cũng có)
-        # source='TCBS' thường có đủ dữ liệu khối ngoại
-        df = stock_historical_data(symbol=symbol.upper(), start_date=start_date, end_date=end_date, source='TCBS')
+        # Dùng hàm stock_historical_data với nguồn TCBS (có dữ liệu khối ngoại)
+        df = stock_historical_data(symbol=symbol.upper(), start_date=start_date, end_date=end_date, resolution='1D', type='stock', source='TCBS')
         
         if df is None or df.empty:
             return []
 
-        # Xử lý dữ liệu trả về
+        # Chuẩn hóa dữ liệu trả về
         results = []
         for index, row in df.iterrows():
-            # TCBS/Vnstock trả về các cột liên quan khối ngoại
-            # Dùng .get() để tránh lỗi nếu tên cột thay đổi
-            buy_vol = row.get('foreign_buy', row.get('nn_mua', 0))
-            sell_vol = row.get('foreign_sell', row.get('nn_ban', 0))
+            # TCBS thường trả về cột 'foreign_buy', 'foreign_sell'
+            # Dùng .get() để an toàn, nếu không có thì mặc định là 0
             
-            # Nếu dữ liệu trả về là None thì gán bằng 0
-            if buy_vol is None: buy_vol = 0
-            if sell_vol is None: sell_vol = 0
+            # Lấy giá trị mua/bán (ép kiểu float để tránh lỗi)
+            buy_vol = float(row.get('foreign_buy', row.get('nn_mua', 0)) or 0)
+            sell_vol = float(row.get('foreign_sell', row.get('nn_ban', 0)) or 0)
             
             # Tính mua ròng
-            net_vol = float(buy_vol) - float(sell_vol)
+            net_vol = buy_vol - sell_vol
             
             results.append({
+                # Lấy ngày (ưu tiên các tên cột phổ biến)
                 "date": str(row.get('time', row.get('ngay', row.get('date', '')))),
-                "buyVol": float(buy_vol),
-                "sellVol": float(sell_vol),
+                "buyVol": buy_vol,
+                "sellVol": sell_vol,
                 "netVolume": net_vol
             })
             
-        # Đảo ngược để ngày mới nhất nằm cuối (cho biểu đồ vẽ đúng chiều)
+        # Đảo ngược mảng để ngày mới nhất nằm cuối (nếu cần) hoặc giữ nguyên tùy chart
+        # Thường chart cần data từ cũ -> mới
         return results
 
     except Exception as e:
