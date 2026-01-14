@@ -4,7 +4,6 @@ from vnstock import Vnstock
 import pandas as pd
 from datetime import datetime, timedelta
 import requests
-import re
 
 app = FastAPI()
 
@@ -18,7 +17,7 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"message": "Stock API with News Crawler is running!"}
+    return {"message": "Stock API with VNDirect Source is running!"}
 
 # --- 1. API LẤY GIÁ (GIỮ NGUYÊN) ---
 @app.get("/api/stock/{symbol}")
@@ -27,7 +26,6 @@ def get_stock(symbol: str):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
         
-        # Thử VCI trước
         try:
             stock = Vnstock().stock(symbol=symbol.upper(), source='VCI')
             df = stock.quote.history(start=start_date, end=end_date, interval='1D')
@@ -50,85 +48,67 @@ def get_stock(symbol: str):
         print(f"Stock Error: {e}")
         return []
 
-# --- 2. HÀM CRAWLER TIN TỨC CAFEF (MỚI) ---
-def crawl_cafef_news(symbol):
-    """
-    Hàm này tự động 'đọc' trang tin tức CafeF của mã cổ phiếu
-    khi API chính thống bị lỗi hoặc rỗng.
-    """
+# --- 2. HÀM LẤY TIN TỪ VNDIRECT (JSON API - CỰC ỔN ĐỊNH) ---
+def get_vndirect_news(symbol):
     try:
-        url = f"https://s.cafef.vn/tin-tuc/{symbol}.chn"
+        # API công khai của VNDirect (trả về JSON, không cần parse HTML)
+        url = "https://finfo-api.vndirect.com.vn/v4/news"
+        params = {
+            "symbol": symbol.upper(),
+            "pageSize": 10,
+            "page": 1
+        }
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
-        response = requests.get(url, headers=headers, timeout=10)
         
-        if response.status_code != 200:
-            return []
-
-        # Dùng Pandas để tìm bảng tin tức (thường CafeF có cấu trúc list)
-        # Hoặc dùng Regex đơn giản để lấy Tiêu đề và Link (nhẹ hơn cài thêm thư viện bs4)
-        html = response.text
+        response = requests.get(url, params=params, headers=headers, timeout=10)
         
-        # Regex tìm các bài tin trong thẻ <li> hoặc <div> class="news-item"
-        # Cấu trúc thường thấy: title="Tiêu đề..." href="/tin-tuc/..."
-        # Lấy 10 tin đầu tiên
-        pattern = r'<a[^>]*href="([^"]+)"[^>]*title="([^"]+)"[^>]*>(.*?)</a>'
-        matches = re.findall(pattern, html)
-        
-        news_list = []
-        seen_titles = set()
-        
-        for link, title, text in matches:
-            if title in seen_titles: continue
-            if len(title) < 10: continue # Bỏ qua tin rác
-            
-            seen_titles.add(title)
-            
-            # Xử lý link (nếu link là tương đối)
-            full_link = link if link.startswith("http") else f"https://cafef.vn{link}"
-            
-            # Xử lý ngày (CafeF thường có ngày trong thẻ span bên cạnh, nhưng để đơn giản ta lấy ngày hiện tại hoặc để trống)
-            # Hoặc regex tìm ngày: <span class="time">...</span>
-            
-            news_list.append({
-                "title": title.strip(),
-                "link": full_link,
-                "publishdate": datetime.now().strftime('%Y-%m-%d'), # Tạm thời để ngày hôm nay
-                "source": "CafeF (Crawler)"
-            })
-            
-            if len(news_list) >= 10: break
-            
-        return news_list
+        if response.status_code == 200:
+            data = response.json()
+            if 'data' in data and len(data['data']) > 0:
+                news_list = []
+                for item in data['data']:
+                    # Tạo link tin tức (VNDirect News)
+                    news_id = item.get('newsId')
+                    # Format link: https://dautu.vndirect.com.vn/tin-tuc/tieu-de-slug-{newsId}
+                    # Để đơn giản ta dẫn về trang news chung hoặc tạo link giả lập
+                    article_link = f"https://dautu.vndirect.com.vn/tin-tuc/chi-tiet-{news_id}"
+                    
+                    news_list.append({
+                        "title": item.get('newsTitle'),
+                        "publishdate": item.get('newsDate', '').split('T')[0], # Lấy phần ngày YYYY-MM-DD
+                        "link": article_link,
+                        "source": "VNDirect"
+                    })
+                return news_list
+        return []
     except Exception as e:
-        print(f"Crawler Error: {e}")
+        print(f"VNDirect Error: {e}")
         return []
 
-# --- 3. API LẤY TIN TỨC (THÔNG MINH) ---
+# --- 3. API TỔNG HỢP ---
 @app.get("/api/news/{symbol}")
 def get_stock_news(symbol: str):
+    print(f"Đang lấy tin cho {symbol}...")
+    
+    # Ưu tiên 1: TCBS (Vnstock)
     try:
-        print(f"Đang lấy tin cho {symbol}...")
+        stock = Vnstock().stock(symbol=symbol.upper(), source='TCBS')
+        df = stock.news()
+        if df is not None and not df.empty:
+            print("=> Lấy từ TCBS thành công")
+            df.columns = [c.lower() for c in df.columns]
+            return df.head(10).to_dict(orient='records')
+    except:
+        pass
         
-        # CÁCH 1: Thử nguồn TCBS (Chính thống)
-        try:
-            stock = Vnstock().stock(symbol=symbol.upper(), source='TCBS')
-            df = stock.news()
-            if df is not None and not df.empty:
-                df.columns = [c.lower() for c in df.columns]
-                return df.head(10).to_dict(orient='records')
-        except:
-            pass
-            
-        # CÁCH 2: Nếu TCBS rỗng -> Dùng Crawler CafeF (Dự phòng hạng nặng)
-        print("TCBS rỗng, kích hoạt Crawler CafeF...")
-        crawler_data = crawl_cafef_news(symbol)
+    # Ưu tiên 2: VNDirect API (Dự phòng xịn)
+    print("=> TCBS rỗng, chuyển sang VNDirect API...")
+    vndirect_data = get_vndirect_news(symbol)
+    
+    if vndirect_data:
+        print(f"=> Lấy được {len(vndirect_data)} tin từ VNDirect")
+        return vndirect_data
         
-        if crawler_data:
-            return crawler_data
-            
-        return []
-    except Exception as e:
-        print(f"News API Error: {e}")
-        return []
+    return []
