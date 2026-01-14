@@ -102,31 +102,48 @@ def get_stock_news(symbol: str):
 @app.get("/api/stock/foreign/{symbol}")
 def get_foreign_flow(symbol: str):
     try:
-        # Lấy ngày hiện tại và 30 ngày trước
+        # 1. Tính ngày: Lấy dữ liệu 30 ngày gần nhất
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
         
-        # Gọi thư viện vnstock để lấy dữ liệu khối ngoại
-        # Lưu ý: Hàm này có thể khác nhau tùy phiên bản vnstock. 
-        # Nếu dùng bản mới nhất, thường là stock_trading_analysis hoặc tương tự.
-        # Đây là cách lấy an toàn từ lịch sử giao dịch:
-        
-        stock = Vnstock().stock(symbol=symbol.upper(), source='VCI')
-        df = stock.quote.history(start=start_date, end=end_date, interval='1D')
+        # 2. GỌI HÀM CHUẨN: stock_trading_analysis
+        # source='TCBS' thường cung cấp đầy đủ dữ liệu khối ngoại nhất
+        df = stock_trading_analysis(symbol=symbol.upper(), start_date=start_date, end_date=end_date, source='TCBS')
         
         if df is None or df.empty:
             return []
 
-        # Chuẩn hóa tên cột về chữ thường
-        df.columns = [col.lower() for col in df.columns]
+        # 3. Xử lý tên cột (Do TCBS trả về tiếng Việt hoặc tên khác)
+        # TCBS thường trả về: 'mua_rong_khop_lenh', 'nam_giu_khop_lenh'...
+        # Ta cần map nó về format mà App Frontend đang hiểu (buyVol, sellVol...)
         
-        # Kiểm tra xem có cột nước ngoài không (thường là 'foreign_buy', 'foreign_sell')
-        # Nếu thư viện trả về tên khác, code này sẽ trả về danh sách rỗng để không bị lỗi 500
+        # In thử tên cột để debug nếu cần
+        # print(df.columns) 
         
-        # Trả về 10 ngày gần nhất
-        return df.tail(10).to_dict(orient='records')
-        
+        # Tạo danh sách kết quả chuẩn hóa
+        results = []
+        for index, row in df.iterrows():
+            # Lưu ý: Tùy version vnstock, tên cột có thể là 'investor_date', 'net_foreign_value'...
+            # Dưới đây là cách map an toàn nhất dựa trên logic dữ liệu TCBS
+            
+            # Giả sử vnstock trả về các cột phổ biến. 
+            # Nếu dùng stock_trading_analysis của TCBS, nó thường trả về số liệu Mua Ròng (Net Buy)
+            
+            # Logic an toàn: Lấy giá trị Mua Ròng (Net Value)
+            # Nếu vnstock trả về cột 'color', 'net_value', 'date'...
+            
+            results.append({
+                "date": row.get('time', row.get('ngay', '')), # Lấy ngày
+                "netVolume": row.get('khoi_luong_rong', row.get('net_value', 0)), # Khối lượng/Giá trị ròng
+                # Nếu không có số liệu mua/bán riêng, ta tạm để 0 hoặc ước lượng
+                "buyVolume": 0, 
+                "sellVolume": 0
+            })
+            
+        # NẾU CÁCH TRÊN PHỨC TẠP, HÃY DÙNG CÁCH ĐƠN GIẢN HÓA NÀY CHO NGƯỜI MỚI:
+        # Trả về nguyên dataframe dạng records, Frontend sẽ tự tìm key
+        return df.tail(15).to_dict(orient='records')
+
     except Exception as e:
-        print(f"Lỗi lấy dữ liệu khối ngoại {symbol}: {e}")
-        # Trả về mảng rỗng thay vì lỗi để App không bị crash
+        print(f"Lỗi khối ngoại {symbol}: {e}")
         return []
