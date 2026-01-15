@@ -1,6 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from vnstock import Vnstock, Quote, Listing, Company, Finance, Trading, Screener, config
+# Import module gốc dưới tên khác để truy cập __file__
+import vnstock as vnstock_lib
+# Import các Class chức năng theo chuẩn mới
+from vnstock import Quote, Listing, Company, Finance, Trading, Screener, config
+# Thử import các hàm tiện ích cũ nếu còn hỗ trợ, nếu không thì bỏ qua để tránh lỗi import
+try:
+    from vnstock import market_top_mover
+except ImportError:
+    market_top_mover = None
+
 import pandas as pd
 from datetime import datetime, timedelta
 import feedparser
@@ -9,8 +18,8 @@ import numpy as np
 import time
 import random
 
-# In version để debug (sửa: dùng Vnstock.__file__)
-print("vnstock loaded from:", Vnstock.__file__)
+# SỬA LỖI: Gọi __file__ từ module thư viện, không phải từ Class
+print("vnstock loaded from:", vnstock_lib.__file__)
 print("Proxy enabled:", config.proxy_enabled)
 
 # Enable proxy tự động cho v3.3.0
@@ -35,6 +44,7 @@ def home():
 def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_foreign: bool = True):
     print(f"Fetching data for {symbol} ({start_date} → {end_date}) - prefer_foreign={prefer_foreign}")
     
+    # Ưu tiên nguồn dựa trên nhu cầu (TCBS thường tốt cho dữ liệu cơ bản, VCI/MSN cho giá)
     sources = ['TCBS', 'MSN', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'MSN']
     
     df = None
@@ -44,40 +54,37 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
         for attempt in range(1, max_attempts + 1):
             print(f"  Attempt {attempt}/{max_attempts}")
             try:
-                quote = Quote(symbol=symbol, source=src, random_agent=True, proxy=True)
+                # Khởi tạo Quote theo chuẩn mới
+                quote = Quote(symbol=symbol, source=src)
                 print(f"  Quote init OK for {src}")
                 
+                # Lấy dữ liệu lịch sử 
                 df = quote.history(start=start_date, end=end_date, interval='1D')
                 
                 if df is not None and not df.empty:
                     print(f"  SUCCESS - {src} (attempt {attempt}) - Rows: {len(df)}")
                     print(f"  Columns: {list(df.columns)}")
-                    break
+                    break # Thoát vòng lặp attempt
                 else:
                     print(f"  No data (df None or empty)")
+            
             except Exception as e:
                 err_str = str(e)
                 print(f"  FAILED: {err_str}")
+                # Retry logic nếu gặp lỗi kết nối
                 if attempt < max_attempts and any(kw in err_str for kw in ['Connection', 'Timeout', 'RetryError']):
                     sleep_time = random.uniform(5, 15)
                     print(f"  Retry after {sleep_time:.1f}s...")
                     time.sleep(sleep_time)
                 continue
+        
+        # Nếu đã có dữ liệu từ source này thì thoát vòng lặp source
         if df is not None and not df.empty:
             break
     
+    # Đã loại bỏ phần fallback cũ dùng Vnstock().stock() vì Quote() ở trên đã bao phủ các nguồn
     if df is None or df.empty:
-        print("→ All Quote sources failed → Trying Vnstock VCI fallback")
-        try:
-            stock = Vnstock().stock(symbol=symbol, source='VCI')
-            df = stock.quote.history(start=start_date, end=end_date, interval='1D')
-            if df is not None and not df.empty:
-                print(f"  VCI fallback SUCCESS - Rows: {len(df)}")
-                print(f"  Columns: {list(df.columns)}")
-            else:
-                print("  VCI fallback returned no data")
-        except Exception as e:
-            print(f"  VCI fallback FAILED: {str(e)}")
+        print("→ All Quote sources failed.")
     
     return df
 
@@ -94,8 +101,10 @@ def get_stock(symbol: str):
         if df is None or df.empty:
             return {"error": "Không lấy được dữ liệu"}
 
+        # Chuẩn hóa tên cột về chữ thường và snake_case
         df.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df.columns]
 
+        # Xử lý cột ngày tháng
         date_col = next((c for c in ['time', 'tradingdate', 'date', 'ngay'] if c in df.columns), None)
         if date_col:
             df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
@@ -104,12 +113,13 @@ def get_stock(symbol: str):
         else:
             df['date'] = ''
 
+        # Xử lý đơn vị giá (nhân 1000 nếu giá < 500 - thường là dữ liệu thô chưa nhân)
         if 'close' in df.columns and df['close'].iloc[-1] < 500:
             for c in ['open', 'high', 'low', 'close']:
                 if c in df.columns:
                     df[c] *= 1000
 
-        # Map foreign columns
+        # Map các cột nước ngoài (vì mỗi nguồn đặt tên khác nhau)
         foreign_buy_candidates = ['foreign_buy', 'nn_mua', 'buy_foreign_volume', 'buy_foreign_qtty', 'nn_buy_vol', 'foreign_buy_vol']
         foreign_sell_candidates = ['foreign_sell', 'nn_ban', 'sell_foreign_volume', 'sell_foreign_qtty', 'nn_sell_vol', 'foreign_sell_vol']
         foreign_net_candidates = ['net_foreign_volume', 'nn_net_vol', 'khoi_ngoai_rong', 'net_foreign', 'foreign_net_vol', 'net_value']
@@ -119,26 +129,34 @@ def get_stock(symbol: str):
         df['foreign_net'] = 0.0
 
         for idx, row in df.iterrows():
+            # Lấy Buy
             for col in foreign_buy_candidates:
                 if col in df.columns and pd.notna(row[col]):
                     df.at[idx, 'foreign_buy'] = float(row[col])
                     break
+            # Lấy Sell
             for col in foreign_sell_candidates:
                 if col in df.columns and pd.notna(row[col]):
                     df.at[idx, 'foreign_sell'] = float(row[col])
                     break
+            
+            # Tính Net
             df.at[idx, 'foreign_net'] = df.at[idx, 'foreign_buy'] - df.at[idx, 'foreign_sell']
+            
+            # Nếu Net = 0 (do thiếu buy/sell), thử tìm cột Net trực tiếp
             if df.at[idx, 'foreign_net'] == 0:
                 for col in foreign_net_candidates:
                     if col in df.columns and pd.notna(row[col]):
                         df.at[idx, 'foreign_net'] = float(row[col])
                         break
 
+        # Tính toán chỉ số phụ
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['foreign_ratio'] = np.where(df['volume'] > 0, (df['foreign_buy'] + df['foreign_sell']) / df['volume'], 0)
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
 
+        # Lấy dữ liệu phiên cuối
         last = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else last
 
@@ -152,6 +170,7 @@ def get_stock(symbol: str):
         cum_net_5d = last['cum_net_5d']
         foreign_ratio_today = last['foreign_ratio']
 
+        # Logic Shark Analysis
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         shark_detail = "Không có tín hiệu rõ ràng"
@@ -182,7 +201,7 @@ def get_stock(symbol: str):
 
         warning = None
         if foreign_net_today == 0 and cum_net_5d == 0:
-            warning = "Dữ liệu khối ngoại không khả dụng (nguồn hiện tại chỉ VCI). Shark chỉ dựa trên volume/price."
+            warning = "Dữ liệu khối ngoại không khả dụng. Shark chỉ dựa trên volume/price."
 
         data_cols = ['date', 'open', 'high', 'low', 'close', 'volume',
                      'foreign_buy', 'foreign_sell', 'foreign_net', 'foreign_ratio']
@@ -314,22 +333,27 @@ def get_index_data(index_symbol: str):
 @app.get("/api/top_mover")
 def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
     try:
-        df = market_top_mover(filter=filter, limit=limit)
-        if df is not None and not df.empty:
-            print(f"Top mover for {filter} - Rows: {len(df)}")
-            return df.to_dict(orient='records')
-        else:
-            return {"error": "Không lấy được dữ liệu top mover"}
+        if market_top_mover:
+            df = market_top_mover(filter=filter, limit=limit)
+            if df is not None and not df.empty:
+                print(f"Top mover for {filter} - Rows: {len(df)}")
+                return df.to_dict(orient='records')
+        
+        return {"error": "Chức năng top mover không khả dụng trong phiên bản này"}
+            
     except Exception as e:
         print(f"Top Mover Error {filter}: {e}")
-        return {"error": "Chức năng top mover chưa hỗ trợ"}
+        return {"error": str(e)}
 
-# --- 7. API REALTIME ---
+# --- 7. API REALTIME (Đã cập nhật class Trading) ---
 @app.get("/api/realtime/{symbol}")
 def get_realtime(symbol: str):
     try:
         symbol = symbol.upper()
-        df = price_board(symbol)
+        # SỬA LỖI: Sử dụng Trading class thay vì hàm price_board() độc lập 
+        trading = Trading(source='VCI') 
+        df = trading.price_board([symbol])
+        
         if df is not None and not df.empty:
             print(f"Realtime data for {symbol}")
             return df.to_dict(orient='records')
@@ -337,7 +361,7 @@ def get_realtime(symbol: str):
             return {"error": "Không lấy được dữ liệu realtime"}
     except Exception as e:
         print(f"Realtime Error {symbol}: {e}")
-        return {"error": "Chức năng realtime chưa hỗ trợ"}
+        return {"error": f"Lỗi Realtime: {str(e)}"}
 
 if __name__ == "__main__":
     import uvicorn
