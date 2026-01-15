@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from vnstock import Vnstock, Quote 
+from vnstock import Vnstock, Quote
 import pandas as pd
 from datetime import datetime, timedelta
 import feedparser
@@ -8,6 +8,7 @@ import urllib.parse
 import numpy as np
 import time
 import random
+
 app = FastAPI()
 
 # Cấu hình CORS
@@ -27,12 +28,12 @@ def home():
 def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_foreign: bool = True):
     print(f"Fetching data for {symbol} ({start_date} → {end_date}) - prefer_foreign={prefer_foreign}")
     
-    # Danh sách nguồn theo thứ tự ưu tiên foreign
-    sources = ['TCBS', 'MSN', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'MSN']
+    # Danh sách nguồn ưu tiên (thêm MSN)
+    sources = ['TCBS', 'MSN', 'DNSE', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'MSN', 'DNSE']
     
     for src in sources:
         print(f"→ Trying source: {src}")
-        max_attempts = 4 if src == 'TCBS' else 2  # Tăng retry cho TCBS
+        max_attempts = 4 if src == 'TCBS' else 2
         for attempt in range(1, max_attempts + 1):
             print(f"  Attempt {attempt}/{max_attempts}")
             try:
@@ -50,7 +51,7 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
             except Exception as e:
                 err_str = str(e)
                 print(f"  FAILED: {err_str}")
-                if attempt < max_attempts and ('Connection' in err_str or 'Timeout' in err_str):
+                if attempt < max_attempts and ('Connection' in err_str or 'Timeout' in err_str or 'RetryError' in err_str):
                     sleep_time = random.uniform(3, 10)
                     print(f"  Retry after {sleep_time:.1f}s...")
                     time.sleep(sleep_time)
@@ -66,6 +67,8 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
             print(f"  VCI fallback SUCCESS - Rows: {len(df)}")
             print(f"  Columns: {list(df.columns)}")
             return df
+        else:
+            print("  VCI fallback returned no data")
     except Exception as e:
         print(f"  VCI fallback FAILED: {str(e)}")
     
@@ -85,7 +88,7 @@ def get_stock(symbol: str):
         if df is None or df.empty:
             return {"error": "Không lấy được dữ liệu"}
 
-        # Chuẩn hóa cột: lowercase & replace space/_ 
+        # Chuẩn hóa cột
         df.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df.columns]
 
         # Xử lý date
@@ -93,15 +96,15 @@ def get_stock(symbol: str):
         if date_col:
             df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
         else:
-            df['date'] = df.index.strftime('%Y-%m-%d') if df.index.name == 'time' else ''
+            df['date'] = df.index.strftime('%Y-%m-%d') if hasattr(df.index, 'name') and df.index.name == 'time' else ''
 
-        # Fix giá nếu đơn vị sai (thường <500 là *1000)
+        # Fix giá nếu đơn vị sai
         if 'close' in df.columns and df['close'].iloc[-1] < 500:
             for c in ['open', 'high', 'low', 'close']:
                 if c in df.columns:
                     df[c] *= 1000
 
-        # Map foreign columns (rất nhiều tên khác nhau tùy nguồn)
+        # Map foreign columns
         foreign_buy_candidates = ['foreign_buy', 'nn_mua', 'buy_foreign_volume', 'buy_foreign_qtty', 'nn_buy_vol', 'foreign_buy_vol']
         foreign_sell_candidates = ['foreign_sell', 'nn_ban', 'sell_foreign_volume', 'sell_foreign_qtty', 'nn_sell_vol', 'foreign_sell_vol']
         foreign_net_candidates = ['net_foreign_volume', 'nn_net_vol', 'khoi_ngoai_rong', 'net_foreign', 'foreign_net_vol', 'net_value']
@@ -111,17 +114,14 @@ def get_stock(symbol: str):
         df['foreign_net'] = 0.0
 
         for idx, row in df.iterrows():
-            # Buy
             for col in foreign_buy_candidates:
                 if col in df.columns and pd.notna(row[col]):
                     df.at[idx, 'foreign_buy'] = float(row[col])
                     break
-            # Sell
             for col in foreign_sell_candidates:
                 if col in df.columns and pd.notna(row[col]):
                     df.at[idx, 'foreign_sell'] = float(row[col])
                     break
-            # Net fallback
             df.at[idx, 'foreign_net'] = df.at[idx, 'foreign_buy'] - df.at[idx, 'foreign_sell']
             if df.at[idx, 'foreign_net'] == 0:
                 for col in foreign_net_candidates:
@@ -129,7 +129,7 @@ def get_stock(symbol: str):
                         df.at[idx, 'foreign_net'] = float(row[col])
                         break
 
-        # Tính thêm indicators cho shark
+        # Tính indicators cho shark
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['foreign_ratio'] = np.where(df['volume'] > 0, (df['foreign_buy'] + df['foreign_sell']) / df['volume'], 0)
@@ -149,7 +149,7 @@ def get_stock(symbol: str):
         cum_net_5d = last['cum_net_5d']
         foreign_ratio_today = last['foreign_ratio']
 
-        # === SHARK ANALYSIS NÂNG CAO ===
+        # SHARK ANALYSIS NÂNG CAO
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         shark_detail = "Không có tín hiệu rõ ràng"
@@ -158,12 +158,12 @@ def get_stock(symbol: str):
             if price_change_pct > 1.5 and foreign_net_today > 0:
                 shark_action = "Cá mập ngoại GOM mạnh"
                 shark_color = "strong_buy"
-                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại +{foreign_net_today:,.0f:,}"
+                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại +{foreign_net_today:,.0f}"
             elif price_change_pct < -1.5 and foreign_net_today < 0:
                 shark_action = "Cá mập ngoại XẢ mạnh"
                 shark_color = "strong_sell"
                 shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại {foreign_net_today:,.0f}"
-            elif foreign_net_today > 100_000:
+            elif foreign_net_today > 100000:
                 shark_action = "Ngoại mua chủ động"
                 shark_color = "buy"
             else:
@@ -178,16 +178,21 @@ def get_stock(symbol: str):
                 shark_action = "Đè giá - Ngoại xả dần"
                 shark_color = "sell"
 
-        elif cum_net_5d > 500_000 and foreign_ratio_today > 0.2:
+        elif cum_net_5d > 500000 and foreign_ratio_today > 0.2:
             shark_action = "Tích lũy ngoại dài hạn"
             shark_color = "buy"
             shark_detail = f"Cum net 5 ngày: +{cum_net_5d:,.0f}"
 
-        # === RESPONSE ===
+        # Cảnh báo nếu không có foreign data
+        warning = None
+        if foreign_net_today == 0 and cum_net_5d == 0:
+            warning = "Dữ liệu khối ngoại không khả dụng (nguồn hiện tại chỉ VCI). Shark analysis chỉ dựa trên volume/price."
+
+        # RESPONSE
         data_cols = ['date', 'open', 'high', 'low', 'close', 'volume',
                      'foreign_buy', 'foreign_sell', 'foreign_net', 'foreign_ratio']
 
-        return {
+        response = {
             "data": df[data_cols].fillna(0).to_dict(orient='records'),
             "latest": {
                 "date": last.get('date', ''),
@@ -206,6 +211,11 @@ def get_stock(symbol: str):
                 "foreign_net_today": float(foreign_net_today)
             }
         }
+
+        if warning:
+            response["warning"] = warning
+
+        return response
 
     except Exception as e:
         print(f"Stock Error {symbol}: {e}")
@@ -283,12 +293,10 @@ def get_stock_news(symbol: str):
                 "source": "Google News"
             })
         return news_list
-    except: return []
+    except Exception as e:
+        print(f"News Error {symbol}: {e}")
+        return []
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
