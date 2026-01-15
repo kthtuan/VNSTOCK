@@ -28,8 +28,12 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
     
     for src in sources:
         try:
-            quote = Quote(symbol=symbol, start=start_date, end=end_date, source=src)
-            df = quote.history()
+            # Khởi tạo Quote chỉ với symbol + source
+            quote = Quote(symbol=symbol, source=src)
+            
+            # Gọi history() với start/end/interval
+            df = quote.history(start=start_date, end=end_date, interval='1D')  # '1D' cho daily
+            
             if df is not None and not df.empty:
                 print(f"Data from {src} for {symbol}")
                 return df
@@ -37,7 +41,7 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
             print(f"Source {src} failed for {symbol}: {e}")
             continue
 
-    # Fallback Vnstock VCI
+    # Fallback Vnstock VCI (cách cũ vẫn ổn)
     try:
         stock = Vnstock().stock(symbol=symbol, source='VCI')
         df = stock.quote.history(start=start_date, end=end_date, interval='1D')
@@ -264,3 +268,4 @@ def get_stock_news(symbol: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
