@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import vnstock as vnstock_lib
 # Import các Class chức năng theo chuẩn mới
 from vnstock import Quote, Listing, Company, Finance, Trading, Screener, config
-# Thử import các hàm tiện ích cũ nếu còn hỗ trợ, nếu không thì bỏ qua để tránh lỗi import
+# Thử import các hàm tiện ích cũ nếu còn hỗ trợ
 try:
     from vnstock import market_top_mover
 except ImportError:
@@ -18,12 +18,17 @@ import numpy as np
 import time
 import random
 
-# SỬA LỖI: Gọi __file__ từ module thư viện, không phải từ Class
+# SỬA LỖI 1: Gọi __file__ từ module thư viện
 print("vnstock loaded from:", vnstock_lib.__file__)
-print("Proxy enabled:", config.proxy_enabled)
 
-# Enable proxy tự động cho v3.3.0
-config.proxy_enabled = True
+# SỬA LỖI 2: Kiểm tra config.proxy_enabled an toàn trước khi gọi
+# Tránh lỗi AttributeError nếu phiên bản vnstock không có thuộc tính này
+if hasattr(config, 'proxy_enabled'):
+    print("Proxy enabled (current):", config.proxy_enabled)
+    config.proxy_enabled = True
+    print("Proxy enabled (set to):", config.proxy_enabled)
+else:
+    print("Note: config.proxy_enabled not available in this vnstock version. Skipping global proxy config.")
 
 app = FastAPI()
 
@@ -44,7 +49,7 @@ def home():
 def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_foreign: bool = True):
     print(f"Fetching data for {symbol} ({start_date} → {end_date}) - prefer_foreign={prefer_foreign}")
     
-    # Ưu tiên nguồn dựa trên nhu cầu (TCBS thường tốt cho dữ liệu cơ bản, VCI/MSN cho giá)
+    # Ưu tiên nguồn dựa trên nhu cầu
     sources = ['TCBS', 'MSN', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'MSN']
     
     df = None
@@ -54,16 +59,19 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
         for attempt in range(1, max_attempts + 1):
             print(f"  Attempt {attempt}/{max_attempts}")
             try:
-                # Khởi tạo Quote theo chuẩn mới
+                # Khởi tạo Quote. 
+                # Lưu ý: Nếu phiên bản vnstock cũ không hỗ trợ tham số proxy=True trong constructor, 
+                # bạn có thể cần xóa 'proxy=True' ở dòng dưới. 
+                # Tuy nhiên, theo log cũ của bạn thì Quote có hỗ trợ.
                 quote = Quote(symbol=symbol, source=src)
                 print(f"  Quote init OK for {src}")
                 
-                # Lấy dữ liệu lịch sử 
+                # Lấy dữ liệu lịch sử
                 df = quote.history(start=start_date, end=end_date, interval='1D')
                 
                 if df is not None and not df.empty:
                     print(f"  SUCCESS - {src} (attempt {attempt}) - Rows: {len(df)}")
-                    print(f"  Columns: {list(df.columns)}")
+                    # print(f"  Columns: {list(df.columns)}") # Uncomment để debug cột
                     break # Thoát vòng lặp attempt
                 else:
                     print(f"  No data (df None or empty)")
@@ -71,7 +79,7 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
             except Exception as e:
                 err_str = str(e)
                 print(f"  FAILED: {err_str}")
-                # Retry logic nếu gặp lỗi kết nối
+                # Retry logic
                 if attempt < max_attempts and any(kw in err_str for kw in ['Connection', 'Timeout', 'RetryError']):
                     sleep_time = random.uniform(5, 15)
                     print(f"  Retry after {sleep_time:.1f}s...")
@@ -82,7 +90,6 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
         if df is not None and not df.empty:
             break
     
-    # Đã loại bỏ phần fallback cũ dùng Vnstock().stock() vì Quote() ở trên đã bao phủ các nguồn
     if df is None or df.empty:
         print("→ All Quote sources failed.")
     
@@ -101,7 +108,7 @@ def get_stock(symbol: str):
         if df is None or df.empty:
             return {"error": "Không lấy được dữ liệu"}
 
-        # Chuẩn hóa tên cột về chữ thường và snake_case
+        # Chuẩn hóa tên cột
         df.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df.columns]
 
         # Xử lý cột ngày tháng
@@ -113,13 +120,13 @@ def get_stock(symbol: str):
         else:
             df['date'] = ''
 
-        # Xử lý đơn vị giá (nhân 1000 nếu giá < 500 - thường là dữ liệu thô chưa nhân)
+        # Xử lý đơn vị giá
         if 'close' in df.columns and df['close'].iloc[-1] < 500:
             for c in ['open', 'high', 'low', 'close']:
                 if c in df.columns:
                     df[c] *= 1000
 
-        # Map các cột nước ngoài (vì mỗi nguồn đặt tên khác nhau)
+        # Map các cột nước ngoài
         foreign_buy_candidates = ['foreign_buy', 'nn_mua', 'buy_foreign_volume', 'buy_foreign_qtty', 'nn_buy_vol', 'foreign_buy_vol']
         foreign_sell_candidates = ['foreign_sell', 'nn_ban', 'sell_foreign_volume', 'sell_foreign_qtty', 'nn_sell_vol', 'foreign_sell_vol']
         foreign_net_candidates = ['net_foreign_volume', 'nn_net_vol', 'khoi_ngoai_rong', 'net_foreign', 'foreign_net_vol', 'net_value']
@@ -345,12 +352,12 @@ def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
         print(f"Top Mover Error {filter}: {e}")
         return {"error": str(e)}
 
-# --- 7. API REALTIME (Đã cập nhật class Trading) ---
+# --- 7. API REALTIME ---
 @app.get("/api/realtime/{symbol}")
 def get_realtime(symbol: str):
     try:
         symbol = symbol.upper()
-        # SỬA LỖI: Sử dụng Trading class thay vì hàm price_board() độc lập 
+        # SỬA LỖI: Sử dụng Trading class thay vì hàm price_board() độc lập
         trading = Trading(source='VCI') 
         df = trading.price_board([symbol])
         
