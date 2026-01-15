@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from vnstock import Vnstock, Quote, Listing, Company, Finance, Trading, Screener, config
+from vnstock import vnstock, Quote, Listing, Company, Finance, Trading, Screener, config
 import pandas as pd
 from datetime import datetime, timedelta
 import feedparser
@@ -66,9 +66,9 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
             break
     
     if df is None or df.empty:
-        print("→ All Quote sources failed → Trying Vnstock VCI fallback")
+        print("→ All Quote sources failed → Trying  VCI fallback")
         try:
-            stock = Vnstock().stock(symbol=symbol, source='VCI')
+            stock = vnstock().stock(symbol=symbol, source='VCI')
             df = stock.quote.history(start=start_date, end=end_date, interval='1D')
             if df is not None and not df.empty:
                 print(f"  VCI fallback SUCCESS - Rows: {len(df)}")
@@ -375,3 +375,4 @@ def get_realtime(symbol: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
