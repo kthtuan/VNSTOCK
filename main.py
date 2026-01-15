@@ -33,44 +33,57 @@ CACHE_DURATION = 300 # 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API Multi-Source (VCI/SSI Trading + Quote Fallback)"}
+    return {"message": "Stock API (SSI Quote Priority)"}
 
 # --- 1. CORE PROCESSING ---
-def process_dataframe(df, source_type='trading'):
+def process_dataframe(df):
     if df is None or df.empty: return None
+    
+    # 1. Chuẩn hóa tên cột về chữ thường
     df.columns = [col.lower() for col in df.columns]
     
+    # 2. Xử lý cột Ngày (SSI thường trả về format 'dd/mm/yyyy' hoặc 'yyyy-mm-dd')
     date_col = next((c for c in ['trading_date', 'time', 'date', 'ngay'] if c in df.columns), None)
     if not date_col: return None
     
-    df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+    # Convert sang datetime rồi format chuẩn YYYY-MM-DD
+    # try/except để xử lý nhiều format ngày khác nhau
+    try:
+        df['date'] = pd.to_datetime(df[date_col], dayfirst=True).dt.strftime('%Y-%m-%d')
+    except:
+        df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+        
     df = df.sort_values('date')
     
-    if source_type == 'trading':
-        df['close'] = df.get('close', 0.0)
-        # Volume: Ưu tiên matched_volume > volume
-        df['volume'] = df.get('matched_volume', df.get('volume', 0.0))
-        
-        # MAPPING KHỐI NGOẠI ĐA NGUỒN
-        # VCI dùng fr_buy_volume_matched
-        # SSI/Khác có thể dùng foreign_buy_volume
-        df['foreign_buy'] = df.get('fr_buy_volume_matched', 
-                            df.get('foreign_buy_volume', 
-                            df.get('buy_foreign_quantity', 0.0)))
-                            
-        df['foreign_sell'] = df.get('fr_sell_volume_matched', 
-                             df.get('foreign_sell_volume', 
-                             df.get('sell_foreign_quantity', 0.0)))
-    else: 
-        # Quote Source
-        df['close'] = df.get('close', 0.0)
-        df['volume'] = df.get('volume', 0.0)
-        df['foreign_buy'] = 0.0
-        df['foreign_sell'] = 0.0
+    # 3. MAPPING CỘT (QUAN TRỌNG)
+    # Cố gắng bắt tất cả các tên cột có thể xuất hiện từ SSI
+    
+    # Giá & Volume
+    df['close'] = df.get('close', 0.0)
+    df['open'] = df.get('open', 0.0)
+    df['high'] = df.get('high', 0.0)
+    df['low'] = df.get('low', 0.0)
+    df['volume'] = df.get('volume', df.get('total_volume', 0.0))
 
+    # Khối ngoại (SSI thường trả về cột 'foreign_buy', 'foreign_sell' hoặc 'buy_foreign_qtty'...)
+    # Ta dùng hàm get với danh sách ưu tiên
+    
+    # Mua
+    df['foreign_buy'] = df.get('foreign_buy', 
+                        df.get('buy_foreign_quantity', 
+                        df.get('buy_foreign_qtty', 
+                        df.get('foreign_buy_volume', 0.0))))
+    
+    # Bán
+    df['foreign_sell'] = df.get('foreign_sell', 
+                         df.get('sell_foreign_quantity', 
+                         df.get('sell_foreign_qtty', 
+                         df.get('foreign_sell_volume', 0.0))))
+
+    # Tính Ròng
     df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
 
-    # Fix đơn vị giá
+    # 4. Fix đơn vị giá (Nếu < 500 thì nhân 1000)
     if not df.empty and df['close'].iloc[-1] < 500:
         for c in ['open', 'high', 'low', 'close']:
             if c in df.columns: df[c] = df[c] * 1000
@@ -78,44 +91,43 @@ def process_dataframe(df, source_type='trading'):
     return df
 
 def get_data_robust(symbol: str, start_date: str, end_date: str):
-    print(f"Fetching {symbol}...")
+    print(f"Fetching {symbol} ({start_date} -> {end_date})...")
 
-    # --- CÁCH 1: TRADING (Để lấy khối ngoại) ---
-    # Thử lần lượt các nguồn Trading mạnh: VCI -> SSI
-    trading_sources = ['VCI', 'SSI']
-    
-    for src in trading_sources:
-        try:
-            print(f"  Attempt Trading source: {src}...")
-            # Thử khởi tạo với các kiểu tham số khác nhau để tương thích version
-            try:
-                trading = Trading(symbol=symbol, source=src)
-                df = trading.price_history(start=start_date, end=end_date)
-            except:
-                trading = Trading(source=src)
-                df = trading.price_history(symbol=symbol, start=start_date, end=end_date)
-            
-            if df is not None and not df.empty:
-                print(f"  -> Success with {src}!")
-                return process_dataframe(df, 'trading'), None
-        except Exception as e:
-            # Log lỗi nhẹ nhàng hơn
-            print(f"  -> {src} failed: {str(e)[:100]}...")
-
-    # --- CÁCH 2: FALLBACK QUOTE (Chỉ lấy giá) ---
+    # --- CHIẾN THUẬT: Ưu tiên Quote(SSI) ---
+    # SSI là nguồn Quote hiếm hoi thường kèm khối ngoại và ít bị chặn
     try:
-        print("  -> Fallback to Quote (Price only)...")
-        quote = Quote(symbol=symbol, source='VCI') # Quote VCI rất lỳ đòn, khó chết
+        print("  Attempt 1: Quote(SSI)...")
+        quote = Quote(symbol=symbol, source='SSI')
         df = quote.history(start=start_date, end=end_date, interval='1D')
         
         if df is not None and not df.empty:
-            return process_dataframe(df, 'quote'), "Dữ liệu khối ngoại tạm thời gián đoạn."
+            # Kiểm tra xem có cột khối ngoại không
+            cols = [c.lower() for c in df.columns]
+            has_foreign = any('foreign' in c for c in cols)
+            
+            print(f"  -> SSI Success! Rows: {len(df)}. Has Foreign columns: {has_foreign}")
+            if not has_foreign:
+                print(f"  -> Warning: SSI data found but columns are: {cols}")
+                
+            return process_dataframe(df), None
     except Exception as e:
-        print(f"  -> Quote failed: {e}")
+        print(f"  -> SSI failed: {e}")
+
+    # --- FALLBACK: Quote(VCI) ---
+    # Nếu SSI lỗi, về lại VCI (chấp nhận mất khối ngoại để App sống)
+    try:
+        print("  Attempt 2: Fallback Quote(VCI)...")
+        quote = Quote(symbol=symbol, source='VCI')
+        df = quote.history(start=start_date, end=end_date, interval='1D')
+        
+        if df is not None and not df.empty:
+            return process_dataframe(df), "Dữ liệu khối ngoại tạm thời gián đoạn (VCI Quote)."
+    except Exception as e:
+        print(f"  -> VCI failed: {e}")
 
     return None, "Không lấy được dữ liệu từ mọi nguồn."
 
-# --- 2. API ENDPOINTS ---
+# --- API ENDPOINTS ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
@@ -192,33 +204,20 @@ def get_realtime(symbol: str):
         df = trading.price_board([symbol.upper()])
         return df.to_dict(orient='records') if df is not None else {"error": "No Data"}
     except Exception as e: return {"error": str(e)}
-@app.get("/api/index/{index_symbol}")
-
-def get_index_data(index_symbol: str):
-
-    try:
-
-        index_symbol = index_symbol.upper()
-
-        # Dùng hàm robust luôn cho chỉ số (VNINDEX, VN30...)
-
-        end_date = datetime.now().strftime('%Y-%m-%d')
-
-        start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
-
-        df, _ = get_data_robust(index_symbol, start_date, end_date)
-
-        if df is not None:
-
-             return df.to_dict(orient='records')
-
-        return {"error": "Không lấy được dữ liệu chỉ số"}
-
-    except Exception as e:
-
-        return {"error": str(e)}
-
         
+@app.get("/api/index/{index_symbol}")
+def get_index_data(index_symbol: str):
+    try:
+        index_symbol = index_symbol.upper()
+        # Dùng hàm robust luôn cho chỉ số (VNINDEX, VN30...)
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        df, _ = get_data_robust(index_symbol, start_date, end_date)
+        if df is not None:
+             return df.to_dict(orient='records')
+        return {"error": "Không lấy được dữ liệu chỉ số"}
+    except Exception as e:
+        return {"error": str(e)}
 @app.get("/api/top_mover")
 def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
     try:
