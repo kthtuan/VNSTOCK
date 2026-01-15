@@ -1,12 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-# Import cả 2 class để dùng linh hoạt
 from vnstock import Vnstock, Quote 
 import pandas as pd
 from datetime import datetime, timedelta
 import feedparser
 import urllib.parse
-import numpy as np # Thêm numpy để xử lý số liệu an toàn hơn
+import numpy as np
 
 app = FastAPI()
 
@@ -21,168 +20,225 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"message": "Stock API is running (Shark Analysis + Smart Fallback)"}
+    return {"message": "Stock API is running (Shark Analysis + Foreign Flow Integrated)"}
 
-# --- 1. HÀM HELPER: LẤY DỮ LIỆU AN TOÀN (Thử nhiều nguồn) ---
-def get_stock_data_safe(symbol: str, start_date: str, end_date: str):
-    # Ưu tiên 1: TCBS (Dữ liệu đầy đủ nhất)
-    try:
-        quote = Quote(symbol=symbol, start=start_date, end=end_date, source='TCBS')
-        df = quote.history()
-        if df is not None and not df.empty: return df
-    except: pass
+# --- 1. HÀM HELPER: LẤY DỮ LIỆU AN TOÀN (Ưu tiên nguồn có foreign) ---
+def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_foreign: bool = True):
+    sources = ['SSI', 'TCBS', 'DNSE', 'VCI'] if prefer_foreign else ['TCBS', 'SSI', 'DNSE', 'VCI']
+    
+    for src in sources:
+        try:
+            quote = Quote(symbol=symbol, start=start_date, end=end_date, source=src)
+            df = quote.history()
+            if df is not None and not df.empty:
+                print(f"Data from {src} for {symbol}")
+                return df
+        except Exception as e:
+            print(f"Source {src} failed for {symbol}: {e}")
+            continue
 
-    # Ưu tiên 2: SSI (Thường có khối ngoại, ít chặn hơn TCBS)
-    try:
-        quote = Quote(symbol=symbol, start=start_date, end=end_date, source='SSI')
-        df = quote.history()
-        if df is not None and not df.empty: return df
-    except: pass
-
-    # Ưu tiên 3: DNSE (Dự phòng)
-    try:
-        quote = Quote(symbol=symbol, start=start_date, end=end_date, source='DNSE')
-        df = quote.history()
-        if df is not None and not df.empty: return df
-    except: pass
-
-    # Ưu tiên 4: VCI (Đường cùng - Chỉ có Giá, không có Khối ngoại)
+    # Fallback Vnstock VCI
     try:
         stock = Vnstock().stock(symbol=symbol, source='VCI')
         df = stock.quote.history(start=start_date, end=end_date, interval='1D')
-        if df is not None and not df.empty: return df
+        if df is not None and not df.empty:
+            return df
     except Exception as e:
-        print(f"Lỗi lấy dữ liệu {symbol}: {e}")
-    
+        print(f"VCI fallback failed: {e}")
+
     return None
 
-# --- 2. API STOCK (TÍCH HỢP PHÂN TÍCH CÁ MẬP VSA) ---
+# --- 2. API STOCK (FULL: OHLCV + Foreign + Shark Analysis nâng cao) ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
+        symbol = symbol.upper()
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
-        
-        # Gọi hàm lấy dữ liệu an toàn
-        df = get_stock_data_safe(symbol.upper(), start_date, end_date)
 
-        if df is None or df.empty: return []
+        df = get_stock_data_safe(symbol, start_date, end_date, prefer_foreign=True)
 
-        # Chuẩn hóa tên cột
-        df.columns = [col.lower() for col in df.columns]
-        
-        # Xử lý ngày tháng
-        if 'time' in df.columns: df['date'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
-        elif 'tradingdate' in df.columns: df['date'] = pd.to_datetime(df['tradingdate']).dt.strftime('%Y-%m-%d')
-            
-        # Fix lỗi đơn vị giá (nếu có)
+        if df is None or df.empty:
+            return {"error": "Không lấy được dữ liệu"}
+
+        # Chuẩn hóa cột: lowercase & replace space/_ 
+        df.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df.columns]
+
+        # Xử lý date
+        date_col = next((c for c in ['time', 'tradingdate', 'date', 'ngay'] if c in df.columns), None)
+        if date_col:
+            df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+        else:
+            df['date'] = df.index.strftime('%Y-%m-%d') if df.index.name == 'time' else ''
+
+        # Fix giá nếu đơn vị sai (thường <500 là *1000)
         if 'close' in df.columns and df['close'].iloc[-1] < 500:
-             for c in ['open', 'high', 'low', 'close']: 
-                 if c in df.columns: df[c] = df[c] * 1000
+            for c in ['open', 'high', 'low', 'close']:
+                if c in df.columns:
+                    df[c] *= 1000
 
-        # === PHÂN TÍCH CÁ MẬP (VSA LOGIC) ===
-        # Tính MA20 của Volume
-        df['ma20_vol'] = df['volume'].rolling(window=20).mean()
-        
-        # Lấy dữ liệu mới nhất
-        last_row = df.iloc[-1]
-        prev_row = df.iloc[-2] if len(df) > 1 else last_row
-        
-        vol_current = last_row['volume']
-        vol_avg = last_row.get('ma20_vol', vol_current) # Nếu không có MA20 thì lấy vol hiện tại
-        
-        # Xử lý chia cho 0
-        if pd.isna(vol_avg) or vol_avg == 0: vol_avg = 1
-            
-        price_change_pct = (last_row['close'] - prev_row['close']) / prev_row['close'] * 100
+        # Map foreign columns (rất nhiều tên khác nhau tùy nguồn)
+        foreign_buy_candidates = ['foreign_buy', 'nn_mua', 'buy_foreign_volume', 'buy_foreign_qtty', 'nn_buy_vol', 'foreign_buy_vol']
+        foreign_sell_candidates = ['foreign_sell', 'nn_ban', 'sell_foreign_volume', 'sell_foreign_qtty', 'nn_sell_vol', 'foreign_sell_vol']
+        foreign_net_candidates = ['net_foreign_volume', 'nn_net_vol', 'khoi_ngoai_rong', 'net_foreign', 'foreign_net_vol', 'net_value']
+
+        df['foreign_buy'] = 0.0
+        df['foreign_sell'] = 0.0
+        df['foreign_net'] = 0.0
+
+        for idx, row in df.iterrows():
+            # Buy
+            for col in foreign_buy_candidates:
+                if col in df.columns and pd.notna(row[col]):
+                    df.at[idx, 'foreign_buy'] = float(row[col])
+                    break
+            # Sell
+            for col in foreign_sell_candidates:
+                if col in df.columns and pd.notna(row[col]):
+                    df.at[idx, 'foreign_sell'] = float(row[col])
+                    break
+            # Net fallback
+            df.at[idx, 'foreign_net'] = df.at[idx, 'foreign_buy'] - df.at[idx, 'foreign_sell']
+            if df.at[idx, 'foreign_net'] == 0:
+                for col in foreign_net_candidates:
+                    if col in df.columns and pd.notna(row[col]):
+                        df.at[idx, 'foreign_net'] = float(row[col])
+                        break
+
+        # Tính thêm indicators cho shark
+        df['volume'] = df['volume'].fillna(0).astype(float)
+        df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
+        df['foreign_ratio'] = np.where(df['volume'] > 0, (df['foreign_buy'] + df['foreign_sell']) / df['volume'], 0)
+        df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
+
+        # Dữ liệu mới nhất
+        last = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) > 1 else last
+
+        vol_current = last['volume']
+        vol_avg = last['ma20_vol'] if not pd.isna(last['ma20_vol']) else 1
         vol_ratio = vol_current / vol_avg
 
-        # Logic VSA đơn giản hóa (Gom hàng/Xả hàng)
+        price_change_pct = ((last['close'] - prev['close']) / prev['close'] * 100) if prev['close'] != 0 else 0
+
+        foreign_net_today = last['foreign_net']
+        cum_net_5d = last['cum_net_5d']
+        foreign_ratio_today = last['foreign_ratio']
+
+        # === SHARK ANALYSIS NÂNG CAO ===
         shark_action = "Lưỡng lự"
-        shark_color = "neutral" # neutral, buy, sell
+        shark_color = "neutral"
+        shark_detail = "Không có tín hiệu rõ ràng"
 
-        if vol_ratio > 1.2: # Vol nổ (Lớn hơn 1.2 lần trung bình)
-            if price_change_pct > 1.0:
-                shark_action = "Gom hàng mạnh"
+        if vol_ratio > 1.5:
+            if price_change_pct > 1.5 and foreign_net_today > 0:
+                shark_action = "Cá mập ngoại GOM mạnh"
+                shark_color = "strong_buy"
+                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại +{foreign_net_today:,.0f:,}"
+            elif price_change_pct < -1.5 and foreign_net_today < 0:
+                shark_action = "Cá mập ngoại XẢ mạnh"
+                shark_color = "strong_sell"
+                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại {foreign_net_today:,.0f}"
+            elif foreign_net_today > 100_000:
+                shark_action = "Ngoại mua chủ động"
                 shark_color = "buy"
-            elif price_change_pct < -1.0:
-                shark_action = "Xả hàng mạnh"
-                shark_color = "sell"
             else:
-                shark_action = "Biến động mạnh"
+                shark_action = "Biến động mạnh (có thể cá mập)"
                 shark_color = "warning"
-        else: # Vol thấp
-            if price_change_pct > 2: shark_action = "Kéo giá (Tiết cung)"
-            elif price_change_pct < -2: shark_action = "Đè giá (Cạn vol)"
-            else: shark_action = "Tích lũy"
 
-        # === TRẢ VỀ KẾT QUẢ ===
-        # Quan trọng: Frontend cần cập nhật để đọc được cấu trúc shark_analysis này
+        elif vol_ratio < 0.7 and abs(price_change_pct) > 2:
+            if price_change_pct > 2 and cum_net_5d > 0:
+                shark_action = "Kéo giá nhẹ - Ngoại tích lũy"
+                shark_color = "buy"
+            elif price_change_pct < -2 and cum_net_5d < 0:
+                shark_action = "Đè giá - Ngoại xả dần"
+                shark_color = "sell"
+
+        elif cum_net_5d > 500_000 and foreign_ratio_today > 0.2:
+            shark_action = "Tích lũy ngoại dài hạn"
+            shark_color = "buy"
+            shark_detail = f"Cum net 5 ngày: +{cum_net_5d:,.0f}"
+
+        # === RESPONSE ===
+        data_cols = ['date', 'open', 'high', 'low', 'close', 'volume',
+                     'foreign_buy', 'foreign_sell', 'foreign_net', 'foreign_ratio']
+
         return {
-            "data": df[['date', 'open', 'high', 'low', 'close', 'volume']].to_dict(orient='records'),
+            "data": df[data_cols].fillna(0).to_dict(orient='records'),
+            "latest": {
+                "date": last.get('date', ''),
+                "close": float(last['close']),
+                "volume": float(vol_current),
+                "foreign_net": float(foreign_net_today),
+                "cum_net_5d": float(cum_net_5d)
+            },
             "shark_analysis": {
                 "action": shark_action,
                 "color": shark_color,
-                "vol_ratio": round(vol_ratio, 2)
+                "detail": shark_detail,
+                "vol_ratio": round(vol_ratio, 2),
+                "price_change_pct": round(price_change_pct, 2),
+                "foreign_ratio": round(foreign_ratio_today, 3),
+                "foreign_net_today": float(foreign_net_today)
             }
         }
 
     except Exception as e:
-        print(f"Stock Error: {e}")
-        return []
+        print(f"Stock Error {symbol}: {e}")
+        return {"error": str(e)}
 
-# --- 3. API KHỐI NGOẠI (THỬ NHIỀU NGUỒN & MAP CỘT) ---
+# --- 3. API KHỐI NGOẠI RIÊNG (tăng range 90 ngày) ---
 @app.get("/api/stock/foreign/{symbol}")
 def get_foreign_flow(symbol: str):
     try:
+        symbol = symbol.upper()
         end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-        
-        # Gọi hàm lấy dữ liệu an toàn
-        df = get_stock_data_safe(symbol.upper(), start_date, end_date)
-        
-        if df is None or df.empty: return []
+        start_date = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+
+        df = get_stock_data_safe(symbol, start_date, end_date, prefer_foreign=True)
+
+        if df is None or df.empty:
+            return []
+
+        df.columns = [col.lower().replace(' ', '_') for col in df.columns]
 
         results = []
-        for index, row in df.iterrows():
+        for _, row in df.iterrows():
             buy = 0.0
             sell = 0.0
-            
-            # Map tên cột từ nhiều nguồn khác nhau (TCBS/SSI/DNSE đều đặt tên khác nhau)
-            # 1. Tìm cột Mua
-            for col in ['foreign_buy', 'nn_mua', 'buy_foreign_qtty', 'buy_total_qtty']:
-                if col in row and pd.notna(row[col]): 
+
+            for col in ['foreign_buy', 'nn_mua', 'buy_foreign_volume', 'nn_buy_vol']:
+                if col in row and pd.notna(row[col]):
                     buy = float(row[col])
                     break
-            
-            # 2. Tìm cột Bán
-            for col in ['foreign_sell', 'nn_ban', 'sell_foreign_qtty', 'sell_total_qtty']:
-                if col in row and pd.notna(row[col]): 
+
+            for col in ['foreign_sell', 'nn_ban', 'sell_foreign_volume', 'nn_sell_vol']:
+                if col in row and pd.notna(row[col]):
                     sell = float(row[col])
                     break
-            
+
             net = buy - sell
-            
-            # 3. Nếu Net = 0, thử tìm cột Net trực tiếp (Fallback)
+
             if net == 0:
-                 for col in ['khoi_luong_rong', 'net_value', 'net_foreign_vol']:
-                    if col in row and pd.notna(row[col]): 
+                for col in ['net_foreign_volume', 'nn_net_vol', 'khoi_ngoai_rong', 'net_foreign']:
+                    if col in row and pd.notna(row[col]):
                         net = float(row[col])
                         break
 
             results.append({
-                "date": str(row.get('time', row.get('ngay', row.get('date', '')))),
+                "date": str(row.get('date') or row.get('time') or row.get('tradingdate') or ''),
                 "buyVol": buy,
                 "sellVol": sell,
                 "netVolume": net
             })
-            
+
         return results
+
     except Exception as e:
         print(f"Foreign Error {symbol}: {e}")
         return []
 
-# --- 4. API TIN TỨC (GIỮ NGUYÊN) ---
+# --- 4. API TIN TỨC (giữ nguyên) ---
 @app.get("/api/news/{symbol}")
 def get_stock_news(symbol: str):
     try:
