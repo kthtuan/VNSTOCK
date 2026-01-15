@@ -28,8 +28,8 @@ def home():
 def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_foreign: bool = True):
     print(f"Fetching data for {symbol} ({start_date} → {end_date}) - prefer_foreign={prefer_foreign}")
     
-    # Danh sách nguồn ưu tiên (thêm MSN)
-    sources = ['TCBS', 'MSN', 'DNSE', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'MSN', 'DNSE']
+    # Danh sách nguồn ưu tiên (thêm MSN, loại bỏ DNSE vì thường fail provider)
+    sources = ['TCBS', 'MSN', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'MSN']
     
     for src in sources:
         print(f"→ Trying source: {src}")
@@ -51,8 +51,8 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
             except Exception as e:
                 err_str = str(e)
                 print(f"  FAILED: {err_str}")
-                if attempt < max_attempts and ('Connection' in err_str or 'Timeout' in err_str or 'RetryError' in err_str):
-                    sleep_time = random.uniform(3, 10)
+                if attempt < max_attempts and any(kw in err_str for kw in ['Connection', 'Timeout', 'RetryError']):
+                    sleep_time = random.uniform(4, 12)
                     print(f"  Retry after {sleep_time:.1f}s...")
                     time.sleep(sleep_time)
                 continue
@@ -91,12 +91,14 @@ def get_stock(symbol: str):
         # Chuẩn hóa cột
         df.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df.columns]
 
-        # Xử lý date
+        # Xử lý date (an toàn hơn)
         date_col = next((c for c in ['time', 'tradingdate', 'date', 'ngay'] if c in df.columns), None)
         if date_col:
             df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+        elif hasattr(df.index, 'name') and df.index.name == 'time':
+            df['date'] = df.index.strftime('%Y-%m-%d')
         else:
-            df['date'] = df.index.strftime('%Y-%m-%d') if hasattr(df.index, 'name') and df.index.name == 'time' else ''
+            df['date'] = ''
 
         # Fix giá nếu đơn vị sai
         if 'close' in df.columns and df['close'].iloc[-1] < 500:
@@ -149,39 +151,42 @@ def get_stock(symbol: str):
         cum_net_5d = last['cum_net_5d']
         foreign_ratio_today = last['foreign_ratio']
 
-        # SHARK ANALYSIS NÂNG CAO
+        # SHARK ANALYSIS NÂNG CAO (dựa volume + price)
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         shark_detail = "Không có tín hiệu rõ ràng"
 
         if vol_ratio > 1.5:
-            if price_change_pct > 1.5 and foreign_net_today > 0:
-                shark_action = "Cá mập ngoại GOM mạnh"
+            if price_change_pct > 1.5:
+                shark_action = "Gom hàng mạnh"
                 shark_color = "strong_buy"
-                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại +{foreign_net_today:,.0f}"
-            elif price_change_pct < -1.5 and foreign_net_today < 0:
-                shark_action = "Cá mập ngoại XẢ mạnh"
+                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá tăng {price_change_pct:.1f}%"
+            elif price_change_pct < -1.5:
+                shark_action = "Xả hàng mạnh"
                 shark_color = "strong_sell"
-                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại {foreign_net_today:,.0f}"
-            elif foreign_net_today > 100000:
-                shark_action = "Ngoại mua chủ động"
-                shark_color = "buy"
+                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá giảm {price_change_pct:.1f}%"
             else:
                 shark_action = "Biến động mạnh (có thể cá mập)"
                 shark_color = "warning"
+                shark_detail = f"Vol nổ {vol_ratio:.1f}x nhưng giá biến động nhỏ"
 
         elif vol_ratio < 0.7 and abs(price_change_pct) > 2:
-            if price_change_pct > 2 and cum_net_5d > 0:
-                shark_action = "Kéo giá nhẹ - Ngoại tích lũy"
+            if price_change_pct > 2:
+                shark_action = "Kéo giá (tiết cung)"
                 shark_color = "buy"
-            elif price_change_pct < -2 and cum_net_5d < 0:
-                shark_action = "Đè giá - Ngoại xả dần"
+                shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá tăng mạnh {price_change_pct:.1f}%"
+            elif price_change_pct < -2:
+                shark_action = "Đè giá (cạn vol)"
                 shark_color = "sell"
+                shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá giảm mạnh {price_change_pct:.1f}%"
 
-        elif cum_net_5d > 500000 and foreign_ratio_today > 0.2:
-            shark_action = "Tích lũy ngoại dài hạn"
-            shark_color = "buy"
-            shark_detail = f"Cum net 5 ngày: +{cum_net_5d:,.0f}"
+        elif abs(price_change_pct) > 2:
+            if price_change_pct > 2:
+                shark_action = "Kéo giá nhẹ"
+                shark_color = "buy"
+            else:
+                shark_action = "Đè giá nhẹ"
+                shark_color = "sell"
 
         # Cảnh báo nếu không có foreign data
         warning = None
