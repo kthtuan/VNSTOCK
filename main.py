@@ -25,51 +25,51 @@ def home():
 
 # --- 1. HÀM HELPER: LẤY DỮ LIỆU AN TOÀN (Ưu tiên nguồn có foreign) ---
 def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_foreign: bool = True):
-    print(f"get_stock_data_safe called for {symbol} from {start_date} to {end_date}")
+    print(f"Fetching data for {symbol} ({start_date} → {end_date}) - prefer_foreign={prefer_foreign}")
     
-    sources = ['TCBS', 'DNSE', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'DNSE']
+    # Danh sách nguồn theo thứ tự ưu tiên foreign
+    sources = ['TCBS', 'MSN', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'MSN']
     
     for src in sources:
-        print(f"Trying source: {src}")
-        for attempt in range(1, 4):  # Tăng lên 3 lần
-            print(f"  Attempt {attempt} for {src}")
+        print(f"→ Trying source: {src}")
+        max_attempts = 4 if src == 'TCBS' else 2  # Tăng retry cho TCBS
+        for attempt in range(1, max_attempts + 1):
+            print(f"  Attempt {attempt}/{max_attempts}")
             try:
                 quote = Quote(symbol=symbol, source=src, random_agent=True)
-                print(f"  Quote initialized for {src}")
+                print(f"  Quote init OK for {src}")
                 
                 df = quote.history(start=start_date, end=end_date, interval='1D')
                 
                 if df is not None and not df.empty:
-                    print(f"  SUCCESS - Data from {src} (attempt {attempt}) for {symbol}")
-                    print(f"  Columns available: {list(df.columns)}")
+                    print(f"  SUCCESS - {src} (attempt {attempt}) - Rows: {len(df)}")
+                    print(f"  Columns: {list(df.columns)}")
                     return df
                 else:
-                    print(f"  No data returned from {src} (df is None or empty)")
-                    
+                    print(f"  No data (df None or empty)")
             except Exception as e:
-                print(f"  FAILED - Source {src} attempt {attempt}: {str(e)}")
-                if attempt < 3 and 'ConnectionError' in str(e):
-                    sleep_time = random.uniform(2, 5)
-                    print(f"  Retrying after {sleep_time:.1f}s")
+                err_str = str(e)
+                print(f"  FAILED: {err_str}")
+                if attempt < max_attempts and ('Connection' in err_str or 'Timeout' in err_str):
+                    sleep_time = random.uniform(3, 10)
+                    print(f"  Retry after {sleep_time:.1f}s...")
                     time.sleep(sleep_time)
                 continue
-            break  # Không retry nếu không phải connection error
+        print(f"→ {src} exhausted all attempts")
     
-    # Fallback VCI
-    print("All Quote sources failed, trying Vnstock VCI fallback")
+    # Fallback Vnstock VCI cổ điển
+    print("→ All Quote sources failed → Trying Vnstock VCI fallback")
     try:
         stock = Vnstock().stock(symbol=symbol, source='VCI')
         df = stock.quote.history(start=start_date, end=end_date, interval='1D')
         if df is not None and not df.empty:
-            print(f"VCI fallback SUCCESS for {symbol}")
-            print(f"VCI columns: {list(df.columns)}")
+            print(f"  VCI fallback SUCCESS - Rows: {len(df)}")
+            print(f"  Columns: {list(df.columns)}")
             return df
-        else:
-            print("VCI fallback returned no data")
     except Exception as e:
-        print(f"VCI fallback FAILED: {str(e)}")
+        print(f"  VCI fallback FAILED: {str(e)}")
     
-    print(f"ALL SOURCES FAILED for {symbol}")
+    print("→ ALL SOURCES FAILED")
     return None
 
 # --- 2. API STOCK (FULL: OHLCV + Foreign + Shark Analysis nâng cao) ---
@@ -288,6 +288,7 @@ def get_stock_news(symbol: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
