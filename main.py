@@ -2,7 +2,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import vnstock as vnstock_lib
 from vnstock import Quote, Trading, config
-# Thử import market_top_mover
 try:
     from vnstock import market_top_mover
 except ImportError:
@@ -10,7 +9,6 @@ except ImportError:
 
 import pandas as pd
 from datetime import datetime, timedelta
-import feedparser
 import urllib.parse
 import numpy as np
 import time
@@ -30,37 +28,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- GLOBAL CACHE ---
 STOCK_CACHE = {}
 CACHE_DURATION = 300 # 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API CLEAN (VCI Trading Core)"}
+    return {"message": "Stock API Multi-Source (VCI/SSI Trading + Quote Fallback)"}
 
-# --- 1. CORE LOGIC ---
+# --- 1. CORE PROCESSING ---
 def process_dataframe(df, source_type='trading'):
     if df is None or df.empty: return None
-    
-    # Chuẩn hóa tên cột
     df.columns = [col.lower() for col in df.columns]
     
-    # Xử lý ngày tháng
     date_col = next((c for c in ['trading_date', 'time', 'date', 'ngay'] if c in df.columns), None)
     if not date_col: return None
     
     df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
     df = df.sort_values('date')
     
-    # MAPPING DỮ LIỆU
     if source_type == 'trading':
         df['close'] = df.get('close', 0.0)
-        # Volume chính xác nhất từ Trading là matched_volume
+        # Volume: Ưu tiên matched_volume > volume
         df['volume'] = df.get('matched_volume', df.get('volume', 0.0))
-        # Mapping khối ngoại chuẩn VCI
-        df['foreign_buy'] = df.get('fr_buy_volume_matched', 0.0)
-        df['foreign_sell'] = df.get('fr_sell_volume_matched', 0.0)
-    else: # Quote fallback
+        
+        # MAPPING KHỐI NGOẠI ĐA NGUỒN
+        # VCI dùng fr_buy_volume_matched
+        # SSI/Khác có thể dùng foreign_buy_volume
+        df['foreign_buy'] = df.get('fr_buy_volume_matched', 
+                            df.get('foreign_buy_volume', 
+                            df.get('buy_foreign_quantity', 0.0)))
+                            
+        df['foreign_sell'] = df.get('fr_sell_volume_matched', 
+                             df.get('foreign_sell_volume', 
+                             df.get('sell_foreign_quantity', 0.0)))
+    else: 
+        # Quote Source
         df['close'] = df.get('close', 0.0)
         df['volume'] = df.get('volume', 0.0)
         df['foreign_buy'] = 0.0
@@ -68,7 +70,7 @@ def process_dataframe(df, source_type='trading'):
 
     df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
 
-    # Fix đơn vị giá (VCI trả về nghìn đồng nếu giá < 500)
+    # Fix đơn vị giá
     if not df.empty and df['close'].iloc[-1] < 500:
         for c in ['open', 'high', 'low', 'close']:
             if c in df.columns: df[c] = df[c] * 1000
@@ -76,39 +78,50 @@ def process_dataframe(df, source_type='trading'):
     return df
 
 def get_data_robust(symbol: str, start_date: str, end_date: str):
-    # CÁCH 1: Dùng Trading (Có khối ngoại)
-    try:
+    print(f"Fetching {symbol}...")
+
+    # --- CÁCH 1: TRADING (Để lấy khối ngoại) ---
+    # Thử lần lượt các nguồn Trading mạnh: VCI -> SSI
+    trading_sources = ['VCI', 'SSI']
+    
+    for src in trading_sources:
         try:
-            trading = Trading(symbol=symbol, source='VCI')
-            df = trading.price_history(start=start_date, end=end_date)
-        except:
-            trading = Trading(source='VCI')
-            df = trading.price_history(symbol=symbol, start=start_date, end=end_date)
+            print(f"  Attempt Trading source: {src}...")
+            # Thử khởi tạo với các kiểu tham số khác nhau để tương thích version
+            try:
+                trading = Trading(symbol=symbol, source=src)
+                df = trading.price_history(start=start_date, end=end_date)
+            except:
+                trading = Trading(source=src)
+                df = trading.price_history(symbol=symbol, start=start_date, end=end_date)
             
-        if df is not None and not df.empty:
-            return process_dataframe(df, 'trading'), None
-    except Exception as e:
-        print(f"Trading API Error: {e}")
+            if df is not None and not df.empty:
+                print(f"  -> Success with {src}!")
+                return process_dataframe(df, 'trading'), None
+        except Exception as e:
+            # Log lỗi nhẹ nhàng hơn
+            print(f"  -> {src} failed: {str(e)[:100]}...")
 
-    # CÁCH 2: Dùng Quote (Dự phòng)
+    # --- CÁCH 2: FALLBACK QUOTE (Chỉ lấy giá) ---
     try:
-        quote = Quote(symbol=symbol, source='VCI')
+        print("  -> Fallback to Quote (Price only)...")
+        quote = Quote(symbol=symbol, source='VCI') # Quote VCI rất lỳ đòn, khó chết
         df = quote.history(start=start_date, end=end_date, interval='1D')
+        
         if df is not None and not df.empty:
-            return process_dataframe(df, 'quote'), "Dữ liệu khối ngoại gián đoạn (Fallback mode)."
-    except:
-        pass
+            return process_dataframe(df, 'quote'), "Dữ liệu khối ngoại tạm thời gián đoạn."
+    except Exception as e:
+        print(f"  -> Quote failed: {e}")
 
-    return None, "Không lấy được dữ liệu."
+    return None, "Không lấy được dữ liệu từ mọi nguồn."
 
-# --- 2. API STOCK (MAIN) ---
+# --- 2. API ENDPOINTS ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
         symbol = symbol.upper()
         current_time = time.time()
         
-        # Cache Check
         if symbol in STOCK_CACHE:
             if current_time - STOCK_CACHE[symbol]['timestamp'] < CACHE_DURATION:
                 return STOCK_CACHE[symbol]['data']
@@ -163,7 +176,6 @@ def get_stock(symbol: str):
     except Exception as e:
         return {"error": str(e)}
 
-# --- 3. API NEWS ---
 @app.get("/api/news/{symbol}")
 def get_stock_news(symbol: str):
     try:
@@ -173,7 +185,6 @@ def get_stock_news(symbol: str):
         return [{"title": e.title, "link": e.link, "publishdate": f"{e.published_parsed.tm_year}-{e.published_parsed.tm_mon:02d}-{e.published_parsed.tm_mday:02d}" if e.get("published_parsed") else "", "source": "Google"} for e in feed.entries[:10]]
     except: return []
 
-# --- 4. API REALTIME ---
 @app.get("/api/realtime/{symbol}")
 def get_realtime(symbol: str):
     try:
@@ -181,23 +192,33 @@ def get_realtime(symbol: str):
         df = trading.price_board([symbol.upper()])
         return df.to_dict(orient='records') if df is not None else {"error": "No Data"}
     except Exception as e: return {"error": str(e)}
-# --- 5. API CHỈ SỐ THỊ TRƯỜNG ---
-
 @app.get("/api/index/{index_symbol}")
+
 def get_index_data(index_symbol: str):
+
     try:
+
         index_symbol = index_symbol.upper()
+
         # Dùng hàm robust luôn cho chỉ số (VNINDEX, VN30...)
+
         end_date = datetime.now().strftime('%Y-%m-%d')
+
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
         df, _ = get_data_robust(index_symbol, start_date, end_date)
+
         if df is not None:
+
              return df.to_dict(orient='records')
+
         return {"error": "Không lấy được dữ liệu chỉ số"}
+
     except Exception as e:
+
         return {"error": str(e)}
+
         
-# --- 5. API TOP MOVER ---
 @app.get("/api/top_mover")
 def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
     try:
