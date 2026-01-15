@@ -9,8 +9,9 @@ import numpy as np
 import time
 import random
 
-# In version để debug (sửa chữ hoa V)
-print("vnstock version:", Vnstock.__version__)
+# In version để debug (sửa: dùng __file__ để xem path thư viện)
+print("vnstock loaded from:", vnstock.__file__)
+print("Proxy enabled:", config.proxy_enabled)
 
 # Enable proxy tự động cho v3.3.0
 config.proxy_enabled = True
