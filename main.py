@@ -9,8 +9,8 @@ import numpy as np
 import time
 import random
 
-# In version để debug
-print("vnstock version:", vnstock.__version__)
+# In version để debug (sửa chữ hoa V)
+print("vnstock version:", Vnstock.__version__)
 
 # Enable proxy tự động cho v3.3.0
 config.proxy_enabled = True
@@ -78,21 +78,6 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
         except Exception as e:
             print(f"  VCI fallback FAILED: {str(e)}")
     
-    # Fallback Trading.foreign_trading for foreign flow
-    try:
-        trading = Trading(source='TCBS')
-        df_foreign = trading.foreign_trading(symbol=symbol, start=start_date, end=end_date)
-        if df_foreign is not None and not df_foreign.empty:
-            print("Trading.foreign_trading SUCCESS - Rows:", len(df_foreign))
-            df_foreign['date'] = pd.to_datetime(df_foreign.get('date', df_foreign.get('time'))).dt.strftime('%Y-%m-%d')
-            df = df.merge(df_foreign[['date', 'buy_volume', 'sell_volume', 'net_volume']], on='date', how='left')
-            df = df.rename(columns={'buy_volume': 'foreign_buy', 'sell_volume': 'foreign_sell', 'net_volume': 'foreign_net'})
-            df['foreign_buy'] = df['foreign_buy'].fillna(0)
-            df['foreign_sell'] = df['foreign_sell'].fillna(0)
-            df['foreign_net'] = df['foreign_net'].fillna(0)
-    except Exception as e:
-        print(f"Trading.foreign_trading fallback failed: {e}")
-
     return df
 
 # --- 2. API STOCK (OHLCV + Foreign + Shark) ---
@@ -108,10 +93,8 @@ def get_stock(symbol: str):
         if df is None or df.empty:
             return {"error": "Không lấy được dữ liệu"}
 
-        # Chuẩn hóa cột
         df.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df.columns]
 
-        # Xử lý date
         date_col = next((c for c in ['time', 'tradingdate', 'date', 'ngay'] if c in df.columns), None)
         if date_col:
             df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
@@ -120,13 +103,12 @@ def get_stock(symbol: str):
         else:
             df['date'] = ''
 
-        # Fix giá
         if 'close' in df.columns and df['close'].iloc[-1] < 500:
             for c in ['open', 'high', 'low', 'close']:
                 if c in df.columns:
                     df[c] *= 1000
 
-        # Map foreign
+        # Map foreign columns
         foreign_buy_candidates = ['foreign_buy', 'nn_mua', 'buy_foreign_volume', 'buy_foreign_qtty', 'nn_buy_vol', 'foreign_buy_vol']
         foreign_sell_candidates = ['foreign_sell', 'nn_ban', 'sell_foreign_volume', 'sell_foreign_qtty', 'nn_sell_vol', 'foreign_sell_vol']
         foreign_net_candidates = ['net_foreign_volume', 'nn_net_vol', 'khoi_ngoai_rong', 'net_foreign', 'foreign_net_vol', 'net_value']
@@ -151,13 +133,11 @@ def get_stock(symbol: str):
                         df.at[idx, 'foreign_net'] = float(row[col])
                         break
 
-        # Tính indicators
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['foreign_ratio'] = np.where(df['volume'] > 0, (df['foreign_buy'] + df['foreign_sell']) / df['volume'], 0)
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
 
-        # Latest
         last = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else last
 
@@ -171,7 +151,6 @@ def get_stock(symbol: str):
         cum_net_5d = last['cum_net_5d']
         foreign_ratio_today = last['foreign_ratio']
 
-        # SHARK ANALYSIS (dựa volume/price, fallback nếu không foreign)
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         shark_detail = "Không có tín hiệu rõ ràng"
@@ -200,12 +179,10 @@ def get_stock(symbol: str):
                 shark_color = "sell"
                 shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá giảm mạnh {price_change_pct:.1f}%"
 
-        # Cảnh báo
         warning = None
         if foreign_net_today == 0 and cum_net_5d == 0:
             warning = "Dữ liệu khối ngoại không khả dụng (nguồn hiện tại chỉ VCI). Shark chỉ dựa trên volume/price."
 
-        # RESPONSE
         data_cols = ['date', 'open', 'high', 'low', 'close', 'volume',
                      'foreign_buy', 'foreign_sell', 'foreign_net', 'foreign_ratio']
 
