@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from vnstock import Vnstock, Quote, index_historical_data, market_top_mover, price_board
-from vnstock import config  # Import config cho proxy v3.3.0
+from vnstock import Vnstock, Quote, Listing, Company, Finance, Trading, Screener, config
 import pandas as pd
 from datetime import datetime, timedelta
 import feedparser
@@ -13,8 +12,8 @@ import random
 # In version để debug
 print("vnstock version:", vnstock.__version__)
 
-# Enable proxy tự động cho vnstock v3.3.0
-config.proxy_enabled = True  # Tự rotate proxy khi fail connection
+# Enable proxy tự động cho v3.3.0
+config.proxy_enabled = True
 
 app = FastAPI()
 
@@ -67,7 +66,6 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
             break
     
     if df is None or df.empty:
-        # Fallback VCI
         print("→ All Quote sources failed → Trying Vnstock VCI fallback")
         try:
             stock = Vnstock().stock(symbol=symbol, source='VCI')
@@ -79,7 +77,22 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
                 print("  VCI fallback returned no data")
         except Exception as e:
             print(f"  VCI fallback FAILED: {str(e)}")
-    
+
+    # Fallback Trading.foreign_trading() cho foreign flow
+    try:
+        trading = Trading(source='TCBS')  # TCBS tốt nhất cho foreign
+        df_foreign = trading.foreign_trading(symbol=symbol, start=start_date, end=end_date)
+        if df_foreign is not None and not df_foreign.empty:
+            print("Trading.foreign_trading SUCCESS - Rows:", len(df_foreign))
+            df_foreign['date'] = pd.to_datetime(df_foreign.get('date', df_foreign.get('time'))).dt.strftime('%Y-%m-%d')
+            df = df.merge(df_foreign[['date', 'buy_volume', 'sell_volume', 'net_volume']], on='date', how='left')
+            df = df.rename(columns={'buy_volume': 'foreign_buy', 'sell_volume': 'foreign_sell', 'net_volume': 'foreign_net'})
+            df['foreign_buy'] = df['foreign_buy'].fillna(0)
+            df['foreign_sell'] = df['foreign_sell'].fillna(0)
+            df['foreign_net'] = df['foreign_net'].fillna(0)
+    except Exception as e:
+        print(f"Trading.foreign_trading fallback failed: {e}")
+
     return df
 
 # --- 2. API STOCK (OHLCV + Foreign + Shark) ---
@@ -95,10 +108,8 @@ def get_stock(symbol: str):
         if df is None or df.empty:
             return {"error": "Không lấy được dữ liệu"}
 
-        # Chuẩn hóa cột
         df.columns = [col.lower().replace(' ', '_').replace('-', '_') for col in df.columns]
 
-        # Xử lý date
         date_col = next((c for c in ['time', 'tradingdate', 'date', 'ngay'] if c in df.columns), None)
         if date_col:
             df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
@@ -107,13 +118,12 @@ def get_stock(symbol: str):
         else:
             df['date'] = ''
 
-        # Fix giá
         if 'close' in df.columns and df['close'].iloc[-1] < 500:
             for c in ['open', 'high', 'low', 'close']:
                 if c in df.columns:
                     df[c] *= 1000
 
-        # Map foreign columns
+        # Map foreign
         foreign_buy_candidates = ['foreign_buy', 'nn_mua', 'buy_foreign_volume', 'buy_foreign_qtty', 'nn_buy_vol', 'foreign_buy_vol']
         foreign_sell_candidates = ['foreign_sell', 'nn_ban', 'sell_foreign_volume', 'sell_foreign_qtty', 'nn_sell_vol', 'foreign_sell_vol']
         foreign_net_candidates = ['net_foreign_volume', 'nn_net_vol', 'khoi_ngoai_rong', 'net_foreign', 'foreign_net_vol', 'net_value']
@@ -138,13 +148,11 @@ def get_stock(symbol: str):
                         df.at[idx, 'foreign_net'] = float(row[col])
                         break
 
-        # Tính indicators cho shark
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['foreign_ratio'] = np.where(df['volume'] > 0, (df['foreign_buy'] + df['foreign_sell']) / df['volume'], 0)
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
 
-        # Dữ liệu mới nhất
         last = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else last
 
@@ -158,41 +166,57 @@ def get_stock(symbol: str):
         cum_net_5d = last['cum_net_5d']
         foreign_ratio_today = last['foreign_ratio']
 
-        # SHARK ANALYSIS (tinh chỉnh cho VN stock, thuần volume/price)
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         shark_detail = "Không có tín hiệu rõ ràng"
 
-        if vol_ratio > 1.3:
-            if price_change_pct > 1.5:
-                shark_action = "Gom hàng mạnh"
-                shark_color = "strong_buy"
-                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá tăng {price_change_pct:.1f}%"
-            elif price_change_pct < -1.5:
-                shark_action = "Xả hàng mạnh"
-                shark_color = "strong_sell"
-                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá giảm {price_change_pct:.1f}%"
-            else:
-                shark_action = "Biến động mạnh (có thể cá mập)"
-                shark_color = "warning"
-                shark_detail = f"Vol cao {vol_ratio:.1f}x nhưng giá sideway"
+        if foreign_net_today != 0:
+            # Logic có foreign
+            if vol_ratio > 1.5:
+                if price_change_pct > 1.5 and foreign_net_today > 0:
+                    shark_action = "Cá mập ngoại GOM mạnh"
+                    shark_color = "strong_buy"
+                    shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại +{foreign_net_today:,.0f}"
+                elif price_change_pct < -1.5 and foreign_net_today < 0:
+                    shark_action = "Cá mập ngoại XẢ mạnh"
+                    shark_color = "strong_sell"
+                    shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại {foreign_net_today:,.0f}"
+                elif foreign_net_today > 100000:
+                    shark_action = "Ngoại mua chủ động"
+                    shark_color = "buy"
+                else:
+                    shark_action = "Biến động mạnh (có thể cá mập)"
+                    shark_color = "warning"
+        else:
+            # Thuần volume/price
+            if vol_ratio > 1.3:
+                if price_change_pct > 1.5:
+                    shark_action = "Gom hàng mạnh"
+                    shark_color = "strong_buy"
+                    shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá tăng {price_change_pct:.1f}%"
+                elif price_change_pct < -1.5:
+                    shark_action = "Xả hàng mạnh"
+                    shark_color = "strong_sell"
+                    shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá giảm {price_change_pct:.1f}%"
+                else:
+                    shark_action = "Biến động mạnh (có thể cá mập)"
+                    shark_color = "warning"
+                    shark_detail = f"Vol cao {vol_ratio:.1f}x nhưng giá sideway"
 
-        elif vol_ratio < 0.6 and abs(price_change_pct) > 2:
-            if price_change_pct > 2:
-                shark_action = "Kéo giá (tiết cung)"
-                shark_color = "buy"
-                shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá tăng mạnh {price_change_pct:.1f}%"
-            elif price_change_pct < -2:
-                shark_action = "Đè giá (cạn vol)"
-                shark_color = "sell"
-                shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá giảm mạnh {price_change_pct:.1f}%"
+            elif vol_ratio < 0.6 and abs(price_change_pct) > 2:
+                if price_change_pct > 2:
+                    shark_action = "Kéo giá (tiết cung)"
+                    shark_color = "buy"
+                    shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá tăng mạnh {price_change_pct:.1f}%"
+                elif price_change_pct < -2:
+                    shark_action = "Đè giá (cạn vol)"
+                    shark_color = "sell"
+                    shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá giảm mạnh {price_change_pct:.1f}%"
 
-        # Cảnh báo
         warning = None
         if foreign_net_today == 0 and cum_net_5d == 0:
             warning = "Dữ liệu khối ngoại không khả dụng (nguồn hiện tại chỉ VCI). Shark chỉ dựa trên volume/price."
 
-        # RESPONSE
         data_cols = ['date', 'open', 'high', 'low', 'close', 'volume',
                      'foreign_buy', 'foreign_sell', 'foreign_net', 'foreign_ratio']
 
@@ -301,7 +325,7 @@ def get_stock_news(symbol: str):
         print(f"News Error {symbol}: {e}")
         return []
 
-# --- 5. API CHỈ SỐ THỊ TRƯỜNG ---
+# --- 5. API CHỈ SỐ THỊ TRƯỜNG (fallback dùng Quote) ---
 @app.get("/api/index/{index_symbol}")
 def get_index_data(index_symbol: str):
     try:
@@ -309,7 +333,7 @@ def get_index_data(index_symbol: str):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
 
-        df = index_historical_data(index=index_symbol, start=start_date, end=end_date)
+        df = get_stock_data_safe(index_symbol, start_date, end_date, prefer_foreign=False)
         if df is not None and not df.empty:
             print(f"Index data for {index_symbol} - Rows: {len(df)}")
             return df.to_dict(orient='records')
@@ -319,7 +343,7 @@ def get_index_data(index_symbol: str):
         print(f"Index Error {index_symbol}: {e}")
         return {"error": str(e)}
 
-# --- 6. API TOP MOVER ---
+# --- 6. API TOP MOVER (nếu market_top_mover tồn tại) ---
 @app.get("/api/top_mover")
 def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
     try:
@@ -331,9 +355,9 @@ def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
             return {"error": "Không lấy được dữ liệu top mover"}
     except Exception as e:
         print(f"Top Mover Error {filter}: {e}")
-        return {"error": str(e)}
+        return {"error": "Chức năng top mover chưa hỗ trợ"}
 
-# --- 7. API REALTIME ---
+# --- 7. API REALTIME (price_board nếu tồn tại) ---
 @app.get("/api/realtime/{symbol}")
 def get_realtime(symbol: str):
     try:
@@ -346,7 +370,7 @@ def get_realtime(symbol: str):
             return {"error": "Không lấy được dữ liệu realtime"}
     except Exception as e:
         print(f"Realtime Error {symbol}: {e}")
-        return {"error": str(e)}
+        return {"error": "Chức năng realtime chưa hỗ trợ"}
 
 if __name__ == "__main__":
     import uvicorn
