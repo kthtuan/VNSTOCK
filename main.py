@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import feedparser
 import urllib.parse
 import numpy as np
-
+import time
 app = FastAPI()
 
 # Cấu hình CORS
@@ -24,32 +24,42 @@ def home():
 
 # --- 1. HÀM HELPER: LẤY DỮ LIỆU AN TOÀN (Ưu tiên nguồn có foreign) ---
 def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_foreign: bool = True):
-    sources = ['SSI', 'TCBS', 'DNSE', 'VCI'] if prefer_foreign else ['TCBS', 'SSI', 'DNSE', 'VCI']
+    # Danh sách nguồn hợp lệ hiện tại (loại SSI, ưu tiên TCBS vì có foreign tốt)
+    sources = ['TCBS', 'DNSE', 'VCI'] if prefer_foreign else ['VCI', 'TCBS', 'DNSE']
     
     for src in sources:
-        try:
-            # Khởi tạo Quote chỉ với symbol + source
-            quote = Quote(symbol=symbol, source=src)
+        for attempt in range(1, 3):  # Thử tối đa 2 lần (chủ yếu cho TCBS connection)
+            try:
+                # Khởi tạo Quote đúng cách: chỉ symbol + source
+                quote = Quote(symbol=symbol, source=src)
+                
+                # Gọi history với tham số đúng
+                df = quote.history(start=start_date, end=end_date, interval='1D')
+                
+                if df is not None and not df.empty:
+                    print(f"Data from {src} (attempt {attempt}) for {symbol}")
+                    return df
+                
+            except Exception as e:
+                print(f"Source {src} attempt {attempt} failed for {symbol}: {e}")
+                if attempt < 2 and 'ConnectionError' in str(e):
+                    time.sleep(2)  # Chờ 2 giây rồi thử lại
+                continue  # Thử attempt tiếp theo
             
-            # Gọi history() với start/end/interval
-            df = quote.history(start=start_date, end=end_date, interval='1D')  # '1D' cho daily
-            
-            if df is not None and not df.empty:
-                print(f"Data from {src} for {symbol}")
-                return df
-        except Exception as e:
-            print(f"Source {src} failed for {symbol}: {e}")
-            continue
+            # Nếu không phải connection error → bỏ qua source này
+            break
 
-    # Fallback Vnstock VCI (cách cũ vẫn ổn)
+    # Fallback Vnstock cổ điển (VCI) nếu Quote fail hết
     try:
         stock = Vnstock().stock(symbol=symbol, source='VCI')
         df = stock.quote.history(start=start_date, end=end_date, interval='1D')
         if df is not None and not df.empty:
+            print(f"VCI fallback success for {symbol}")
             return df
     except Exception as e:
-        print(f"VCI fallback failed: {e}")
+        print(f"VCI fallback failed for {symbol}: {e}")
 
+    print(f"All sources failed for {symbol}")
     return None
 
 # --- 2. API STOCK (FULL: OHLCV + Foreign + Shark Analysis nâng cao) ---
@@ -268,4 +278,5 @@ def get_stock_news(symbol: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
