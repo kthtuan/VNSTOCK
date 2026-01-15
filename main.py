@@ -10,10 +10,13 @@ import numpy as np
 import time
 import random
 
-app = FastAPI()
+# In version để debug
+print("vnstock version:", vnstock.__version__)
 
 # Enable proxy tự động cho vnstock v3.3.0
 config.proxy_enabled = True  # Tự rotate proxy khi fail connection
+
+app = FastAPI()
 
 # Cấu hình CORS
 app.add_middleware(
@@ -155,48 +158,34 @@ def get_stock(symbol: str):
         cum_net_5d = last['cum_net_5d']
         foreign_ratio_today = last['foreign_ratio']
 
-        # SHARK ANALYSIS (dựa volume/price, fallback nếu không foreign)
+        # SHARK ANALYSIS (tinh chỉnh cho VN stock, thuần volume/price)
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         shark_detail = "Không có tín hiệu rõ ràng"
 
-        if foreign_net_today != 0:
-            # Logic có foreign (nếu TCBS thành công)
-            if vol_ratio > 1.5:
-                if price_change_pct > 1.5 and foreign_net_today > 0:
-                    shark_action = "Cá mập ngoại GOM mạnh"
-                    shark_color = "strong_buy"
-                    shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại +{foreign_net_today:,.0f}"
-                elif price_change_pct < -1.5 and foreign_net_today < 0:
-                    shark_action = "Cá mập ngoại XẢ mạnh"
-                    shark_color = "strong_sell"
-                    shark_detail = f"Vol nổ {vol_ratio:.1f}x + Net ngoại {foreign_net_today:,.0f}"
-            # ... (các case khác như trước)
-        else:
-            # Thuần volume/price
-            if vol_ratio > 1.3:
-                if price_change_pct > 1.5:
-                    shark_action = "Gom hàng mạnh"
-                    shark_color = "strong_buy"
-                    shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá tăng {price_change_pct:.1f}%"
-                elif price_change_pct < -1.5:
-                    shark_action = "Xả hàng mạnh"
-                    shark_color = "strong_sell"
-                    shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá giảm {price_change_pct:.1f}%"
-                else:
-                    shark_action = "Biến động mạnh (có thể cá mập)"
-                    shark_color = "warning"
-                    shark_detail = f"Vol cao {vol_ratio:.1f}x nhưng giá sideway"
+        if vol_ratio > 1.3:
+            if price_change_pct > 1.5:
+                shark_action = "Gom hàng mạnh"
+                shark_color = "strong_buy"
+                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá tăng {price_change_pct:.1f}%"
+            elif price_change_pct < -1.5:
+                shark_action = "Xả hàng mạnh"
+                shark_color = "strong_sell"
+                shark_detail = f"Vol nổ {vol_ratio:.1f}x + Giá giảm {price_change_pct:.1f}%"
+            else:
+                shark_action = "Biến động mạnh (có thể cá mập)"
+                shark_color = "warning"
+                shark_detail = f"Vol cao {vol_ratio:.1f}x nhưng giá sideway"
 
-            elif vol_ratio < 0.6 and abs(price_change_pct) > 2:
-                if price_change_pct > 2:
-                    shark_action = "Kéo giá (tiết cung)"
-                    shark_color = "buy"
-                    shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá tăng mạnh {price_change_pct:.1f}%"
-                elif price_change_pct < -2:
-                    shark_action = "Đè giá (cạn vol)"
-                    shark_color = "sell"
-                    shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá giảm mạnh {price_change_pct:.1f}%"
+        elif vol_ratio < 0.6 and abs(price_change_pct) > 2:
+            if price_change_pct > 2:
+                shark_action = "Kéo giá (tiết cung)"
+                shark_color = "buy"
+                shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá tăng mạnh {price_change_pct:.1f}%"
+            elif price_change_pct < -2:
+                shark_action = "Đè giá (cạn vol)"
+                shark_color = "sell"
+                shark_detail = f"Vol thấp {vol_ratio:.1f}x + Giá giảm mạnh {price_change_pct:.1f}%"
 
         # Cảnh báo
         warning = None
@@ -330,7 +319,7 @@ def get_index_data(index_symbol: str):
         print(f"Index Error {index_symbol}: {e}")
         return {"error": str(e)}
 
-# --- 6. API TOP MOVER (top tăng/giảm, foreign trading) ---
+# --- 6. API TOP MOVER ---
 @app.get("/api/top_mover")
 def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
     try:
@@ -344,7 +333,7 @@ def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
         print(f"Top Mover Error {filter}: {e}")
         return {"error": str(e)}
 
-# --- 7. API REALTIME (price board) ---
+# --- 7. API REALTIME ---
 @app.get("/api/realtime/{symbol}")
 def get_realtime(symbol: str):
     try:
@@ -362,5 +351,3 @@ def get_realtime(symbol: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
