@@ -9,8 +9,8 @@ import numpy as np
 import time
 import random
 
-# In version để debug (sửa: dùng __file__ để xem path thư viện)
-print("vnstock loaded from:", vnstock.__file__)
+# In version để debug (sửa: dùng Vnstock.__file__)
+print("vnstock loaded from:", Vnstock.__file__)
 print("Proxy enabled:", config.proxy_enabled)
 
 # Enable proxy tự động cho v3.3.0
@@ -292,7 +292,7 @@ def get_stock_news(symbol: str):
         print(f"News Error {symbol}: {e}")
         return []
 
-# --- 5. API CHỈ SỐ THỊ TRƯỜNG (fallback Quote cho VNINDEX, HNXINDEX...) ---
+# --- 5. API CHỈ SỐ THỊ TRƯỜNG ---
 @app.get("/api/index/{index_symbol}")
 def get_index_data(index_symbol: str):
     try:
@@ -310,7 +310,7 @@ def get_index_data(index_symbol: str):
         print(f"Index Error {index_symbol}: {e}")
         return {"error": str(e)}
 
-# --- 6. API TOP MOVER (nếu market_top_mover tồn tại) ---
+# --- 6. API TOP MOVER ---
 @app.get("/api/top_mover")
 def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
     try:
@@ -324,7 +324,7 @@ def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
         print(f"Top Mover Error {filter}: {e}")
         return {"error": "Chức năng top mover chưa hỗ trợ"}
 
-# --- 7. API REALTIME (price_board nếu tồn tại) ---
+# --- 7. API REALTIME ---
 @app.get("/api/realtime/{symbol}")
 def get_realtime(symbol: str):
     try:
