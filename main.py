@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from vnstock import Vnstock, Quote, foreign_trade, index_historical_data, market_top_mover, price_board
+from vnstock import config  # Import config cho proxy v3.3.0
 import pandas as pd
 from datetime import datetime, timedelta
 import feedparser
@@ -10,6 +11,9 @@ import time
 import random
 
 app = FastAPI()
+
+# Enable proxy tự động cho vnstock v3.3.0
+config.proxy_enabled = True  # Tự rotate proxy khi fail connection
 
 # Cấu hình CORS
 app.add_middleware(
@@ -24,7 +28,7 @@ app.add_middleware(
 def home():
     return {"message": "Stock API is running (Shark Analysis + Foreign Flow Integrated)"}
 
-# --- 1. HÀM HELPER: LẤY DỮ LIỆU AN TOÀN (OHLCV + volume, merge foreign nếu có) ---
+# --- 1. HÀM HELPER: LẤY DỮ LIỆU AN TOÀN ---
 def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_foreign: bool = True):
     print(f"Fetching data for {symbol} ({start_date} → {end_date}) - prefer_foreign={prefer_foreign}")
     
@@ -37,7 +41,7 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
         for attempt in range(1, max_attempts + 1):
             print(f"  Attempt {attempt}/{max_attempts}")
             try:
-                quote = Quote(symbol=symbol, source=src, random_agent=True)
+                quote = Quote(symbol=symbol, source=src, random_agent=True, proxy=True)  # Enable proxy v3.3.0
                 print(f"  Quote init OK for {src}")
                 
                 df = quote.history(start=start_date, end=end_date, interval='1D')
@@ -57,10 +61,10 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
                     time.sleep(sleep_time)
                 continue
         if df is not None and not df.empty:
-            break  # Thoát nếu lấy thành công từ 1 nguồn
+            break
     
     if df is None or df.empty:
-        # Fallback Vnstock VCI
+        # Fallback VCI
         print("→ All Quote sources failed → Trying Vnstock VCI fallback")
         try:
             stock = Vnstock().stock(symbol=symbol, source='VCI')
@@ -72,14 +76,13 @@ def get_stock_data_safe(symbol: str, start_date: str, end_date: str, prefer_fore
                 print("  VCI fallback returned no data")
         except Exception as e:
             print(f"  VCI fallback FAILED: {str(e)}")
-            return None
 
-    # Fallback merge foreign_trade nếu có
+    # Fallback merge foreign_trade
     try:
         df_foreign = foreign_trade(symbol=symbol, start=start_date, end=end_date)
         if not df_foreign.empty:
-            print("foreign_trade SUCCESS - Rows: {len(df_foreign)}")
-            df_foreign['date'] = pd.to_datetime(df_foreign.get('time', df_foreign.get('date'))).dt.strftime('%Y-%m-%d')
+            print("foreign_trade SUCCESS - Rows:", len(df_foreign))
+            df_foreign['date'] = pd.to_datetime(df_foreign.get('date', df_foreign.get('time'))).dt.strftime('%Y-%m-%d')
             df = df.merge(df_foreign[['date', 'buy_volume', 'sell_volume', 'net_volume']], on='date', how='left')
             df = df.rename(columns={'buy_volume': 'foreign_buy', 'sell_volume': 'foreign_sell', 'net_volume': 'foreign_net'})
             df['foreign_buy'] = df['foreign_buy'].fillna(0)
@@ -388,3 +391,4 @@ def get_realtime(symbol: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
