@@ -2,12 +2,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import vnstock as vnstock_lib
 from vnstock import Quote, Trading, config
+try:
+    from vnstock import market_top_mover
+except ImportError:
+    market_top_mover = None
+
 import pandas as pd
 from datetime import datetime, timedelta
 import urllib.parse
 import numpy as np
 import time
-import requests # Cần import requests để "giả danh" trình duyệt
+import requests # Cần import requests để giả lập trình duyệt
 
 # --- CONFIG ---
 print("vnstock loaded from:", vnstock_lib.__file__)
@@ -25,24 +30,22 @@ app.add_middleware(
 )
 
 STOCK_CACHE = {}
-CACHE_DURATION = 300 # 5 phút
+CACHE_DURATION = 300 # Cache 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API (Direct SSI Fetcher with Headers)"}
+    return {"message": "Stock API Ultimate (Direct SSI + Shark V2)"}
 
 # --- 1. HÀM ĐẶC NHIỆM: GỌI TRỰC TIẾP SSI (Fake Browser) ---
 def get_foreign_direct_ssi(symbol: str, start_date: str, end_date: str):
     """
     Hàm này tự gọi API của SSI, giả danh trình duyệt Chrome để tránh bị chặn IP trên Render.
-    Bỏ qua thư viện vnstock để kiểm soát hoàn toàn Headers.
     """
     print(f"🕵️  Direct Fetch SSI for {symbol}...")
     
-    # URL API của SSI iBoard (API này thường rất ổn định)
     url = "https://iboard.ssi.com.vn/dchart/api/history"
     
-    # Headers giả lập trình duyệt Chrome trên Windows
+    # Headers giả lập Chrome Windows
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -53,12 +56,10 @@ def get_foreign_direct_ssi(symbol: str, start_date: str, end_date: str):
         "sec-ch-ua-platform": '"Windows"'
     }
     
-    # Convert date sang timestamp (SSI dùng timestamp)
     try:
         start_ts = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp())
         end_ts = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp())
     except:
-        # Fallback nếu date lỗi
         end_ts = int(time.time())
         start_ts = end_ts - 31536000 # 1 năm
 
@@ -75,7 +76,6 @@ def get_foreign_direct_ssi(symbol: str, start_date: str, end_date: str):
         if response.status_code == 200:
             data = response.json()
             if "t" in data and len(data["t"]) > 0:
-                # SSI trả về dạng cột tách rời: t (time), c (close), v (volume)...
                 df = pd.DataFrame({
                     "date": pd.to_datetime(data["t"], unit='s').strftime('%Y-%m-%d'),
                     "close": data["c"],
@@ -85,23 +85,12 @@ def get_foreign_direct_ssi(symbol: str, start_date: str, end_date: str):
                     "volume": data["v"]
                 })
                 
-                # --- LẤY DỮ LIỆU KHỐI NGOẠI ---
-                # SSI iBoard API đôi khi trả về trường 'foreign' riêng hoặc nằm trong data khác
-                # Tuy nhiên, endpoint /history chuẩn của SSI đôi khi thiếu foreign.
-                # Nếu thiếu, ta thử endpoint thứ 2 chuyên về Foreign.
-                
-                # Để đơn giản và hiệu quả, ta thử request endpoint Foreign riêng của SSI
-                # URL: https://iboard.ssi.com.vn/dchart/api/1.1/foreignTrading
-                # Nhưng để tránh phức tạp, ta sẽ thử check dữ liệu cơ bản trước.
-                
-                # Nếu endpoint trên không có foreign, ta sẽ return dữ liệu giá trước
-                # và báo warning. Nhưng thường endpoint này ĐỦ dữ liệu để vẽ chart.
-                
-                # Tạo cột giả định là 0 nếu không tìm thấy
+                # SSI Direct API /history cơ bản thường không trả kèm Foreign
+                # Tuy nhiên ta cứ tạo cột placeholder để code phía sau không lỗi
+                # Nếu muốn chuẩn Foreign từ Direct, cần gọi thêm API /foreignTrading riêng
                 df['foreign_buy'] = 0.0
                 df['foreign_sell'] = 0.0
                 
-                print(f"  -> Direct SSI Success: {len(df)} rows")
                 return df
                 
         print(f"  -> Direct SSI Failed: Status {response.status_code}")
@@ -110,23 +99,30 @@ def get_foreign_direct_ssi(symbol: str, start_date: str, end_date: str):
         
     return None
 
-
 # --- 2. CORE PROCESSING ---
 def process_dataframe(df):
     if df is None or df.empty: return None
     df.columns = [col.lower() for col in df.columns]
     
-    # Xử lý date
     date_col = next((c for c in ['date', 'time', 'trading_date'] if c in df.columns), None)
     if date_col and date_col != 'date':
-        df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
-        
+        try:
+            df['date'] = pd.to_datetime(df[date_col], dayfirst=True).dt.strftime('%Y-%m-%d')
+        except:
+            df['date'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+            
     df = df.sort_values('date')
     
     # Ensure columns exist
     for col in ['close', 'volume', 'foreign_buy', 'foreign_sell']:
         if col not in df.columns: df[col] = 0.0
-        
+    
+    # Mapping Foreign columns if available (from Vnstock Quote SSI)
+    if 'buy_foreign_quantity' in df.columns: df['foreign_buy'] = df['buy_foreign_quantity']
+    if 'sell_foreign_quantity' in df.columns: df['foreign_sell'] = df['sell_foreign_quantity']
+    if 'foreign_buy_volume' in df.columns: df['foreign_buy'] = df['foreign_buy_volume']
+    if 'foreign_sell_volume' in df.columns: df['foreign_sell'] = df['foreign_sell_volume']
+
     df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
     
     # Fix đơn vị giá
@@ -137,36 +133,28 @@ def process_dataframe(df):
     return df
 
 def get_data_robust(symbol: str, start_date: str, end_date: str):
-    # CÁCH 1: THỬ VNSTOCK TRADING (VCI/SSI)
+    # CÁCH 1: SSI DIRECT REQUEST (Mạnh nhất trên Render)
+    df_direct = get_foreign_direct_ssi(symbol, start_date, end_date)
+    if df_direct is not None and not df_direct.empty:
+        return process_dataframe(df_direct), "Dữ liệu từ SSI Direct (Có thể thiếu Foreign Flow)."
+
+    # CÁCH 2: VNSTOCK QUOTE (SSI)
     try:
-        # Code cũ...
-        trading = Trading(symbol=symbol, source='VCI')
-        df = trading.price_history(start=start_date, end=end_date)
+        print("  -> Fallback to Vnstock Quote(SSI)...")
+        quote = Quote(symbol=symbol, source='SSI')
+        df = quote.history(start=start_date, end=end_date, interval='1D')
         if df is not None and not df.empty:
-            # Map cột chuẩn
-            df = df.rename(columns={
-                'fr_buy_volume_matched': 'foreign_buy', 
-                'fr_sell_volume_matched': 'foreign_sell',
-                'matched_volume': 'volume'
-            })
             return process_dataframe(df), None
     except:
         pass
 
-    # CÁCH 2: THỬ DIRECT REQUEST (Hàm Đặc Nhiệm Mới)
-    # Đây là hy vọng lớn nhất trên Render
-    df_direct = get_foreign_direct_ssi(symbol, start_date, end_date)
-    if df_direct is not None and not df_direct.empty:
-        # Lưu ý: Hàm direct SSI /history cơ bản có thể thiếu Foreign.
-        # Nếu muốn Foreign chính xác, cần gọi thêm 1 API nữa, nhưng tạm thời lấy giá cho App chạy đã.
-        return process_dataframe(df_direct), "Dữ liệu từ SSI Direct (Có thể thiếu Foreign Flow)."
-
-    # CÁCH 3: FALLBACK QUOTE (Vnstock)
+    # CÁCH 3: VNSTOCK QUOTE (VCI)
     try:
+        print("  -> Fallback to Vnstock Quote(VCI)...")
         quote = Quote(symbol=symbol, source='VCI')
         df = quote.history(start=start_date, end=end_date, interval='1D')
         if df is not None:
-            return process_dataframe(df), "Dữ liệu dự phòng từ VCI Quote."
+            return process_dataframe(df), "Dữ liệu dự phòng từ VCI Quote (Không có khối ngoại)."
     except:
         pass
 
@@ -190,7 +178,7 @@ def get_stock(symbol: str):
         
         if df is None: return {"error": warning}
 
-        # Shark Logic & Calculations
+        # Tính toán chỉ số
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
@@ -202,7 +190,7 @@ def get_stock(symbol: str):
         vol_ratio = last['volume'] / (last['ma20_vol'] if last['ma20_vol'] > 0 else 1)
         price_change = ((last['close'] - prev['close']) / prev['close'] * 100) if prev['close'] > 0 else 0
         
-        # Shark Analysis V2
+        # --- SHARK ANALYSIS V2 ---
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         shark_detail = f"Vol {vol_ratio:.1f}x, Giá {price_change:.1f}%"
@@ -215,12 +203,17 @@ def get_stock(symbol: str):
         
         if IS_VOL_SPIKE:
             if IS_PRICE_UP:
-                if IS_FOREIGN_BUY: shark_action, shark_color = "Gom hàng mạnh (Uy tín)", "strong_buy"
-                elif IS_FOREIGN_SELL: shark_action, shark_color = "Coi chừng Kéo Xả (FOMO)", "warning"
-                else: shark_action, shark_color = "Dòng tiền đầu cơ nóng", "buy"
+                if IS_FOREIGN_BUY: 
+                    shark_action, shark_color = "Gom hàng mạnh (Uy tín)", "strong_buy"
+                elif IS_FOREIGN_SELL: 
+                    shark_action, shark_color = "Coi chừng Kéo Xả (FOMO)", "warning"
+                else: 
+                    shark_action, shark_color = "Dòng tiền đầu cơ nóng", "buy"
             elif IS_PRICE_DOWN:
-                if IS_FOREIGN_BUY: shark_action, shark_color = "Đè gom (Hoảng loạn)", "buy"
-                else: shark_action, shark_color = "Xả hàng mạnh", "strong_sell"
+                if IS_FOREIGN_BUY: 
+                    shark_action, shark_color = "Đè gom (Hoảng loạn)", "buy"
+                else: 
+                    shark_action, shark_color = "Xả hàng mạnh", "strong_sell"
             else:
                 shark_action = "Biến động mạnh"
 
@@ -274,6 +267,19 @@ def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
             if df is not None: return df.to_dict(orient='records')
         return {"error": "Not Supported"}
     except: return {"error": "Error"}
+
+@app.get("/api/index/{index_symbol}")
+def get_index_data(index_symbol: str):
+    try:
+        index_symbol = index_symbol.upper()
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        df, _ = get_data_robust(index_symbol, start_date, end_date)
+        if df is not None:
+             return df.to_dict(orient='records')
+        return {"error": "Không lấy được dữ liệu chỉ số"}
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
