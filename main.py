@@ -2,18 +2,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import vnstock as vnstock_lib
 from vnstock import Quote, Trading, config
-try:
-    from vnstock import market_top_mover
-except ImportError:
-    market_top_mover = None
-
 import pandas as pd
 from datetime import datetime, timedelta
 import urllib.parse
 import numpy as np
 import time
 import requests
-import json
 
 # --- CONFIG ---
 print("vnstock loaded from:", vnstock_lib.__file__)
@@ -31,91 +25,17 @@ app.add_middleware(
 )
 
 STOCK_CACHE = {}
-CACHE_DURATION = 300 # 5 phút
+CACHE_DURATION = 300 # Cache 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API (VNDirect Source for Foreign Data)"}
+    return {"message": "Stock API (VCI Quote + Realtime Foreign Merge)"}
 
-# --- 1. HÀM ĐẶC NHIỆM: GỌI TRỰC TIẾP VNDIRECT (Finfo) ---
-def get_stock_direct_vndirect(symbol: str, start_date: str, end_date: str):
-    """
-    Gọi API Finfo của VNDirect để lấy dữ liệu giá + khối ngoại.
-    API này thường ổn định hơn SSI/TCBS trên môi trường Cloud.
-    """
-    print(f"🕵️  Direct Fetch VNDirect for {symbol}...")
-    
-    # URL API Finfo VNDirect
-    url = "https://finfo-api.vndirect.com.vn/v4/stock_prices"
-    
-    # Headers giả lập
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": "https://dstock.vndirect.com.vn",
-        "Referer": "https://dstock.vndirect.com.vn/"
-    }
-    
-    # Query parameters
-    # sort=date:asc để lấy từ cũ đến mới
-    # q=code:SYMBOL~date:gte:START_DATE~date:lte:END_DATE
-    query = f"code:{symbol}~date:gte:{start_date}~date:lte:{end_date}"
-    
-    params = {
-        "sort": "date",
-        "q": query,
-        "size": 365, # Lấy tối đa 1 năm
-        "page": 1
-    }
-
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if "data" in data and len(data["data"]) > 0:
-                items = data["data"]
-                
-                # Chuyển đổi JSON thành DataFrame
-                df = pd.DataFrame(items)
-                
-                # Mapping cột VNDirect sang chuẩn chung
-                # date -> date
-                # close -> close
-                # nmVolume (Matched Volume) -> volume
-                # foreignBuyVolume -> foreign_buy
-                # foreignSellVolume -> foreign_sell
-                
-                rename_map = {
-                    "date": "date",
-                    "close": "close",
-                    "open": "open",
-                    "high": "high",
-                    "low": "low",
-                    "nmVolume": "volume", # Khối lượng khớp lệnh
-                    "foreignBuyVolume": "foreign_buy",
-                    "foreignSellVolume": "foreign_sell"
-                }
-                
-                # Chỉ lấy các cột cần thiết nếu tồn tại
-                cols_to_keep = [c for c in rename_map.keys() if c in df.columns]
-                df = df[cols_to_keep].rename(columns=rename_map)
-                
-                print(f"  -> VNDirect Success: {len(df)} rows")
-                return df
-                
-        print(f"  -> VNDirect Failed: Status {response.status_code}")
-    except Exception as e:
-        print(f"  -> VNDirect Error: {e}")
-        
-    return None
-
-
-# --- 2. CORE PROCESSING ---
+# --- 1. CORE PROCESSING ---
 def process_dataframe(df):
     if df is None or df.empty: return None
     df.columns = [col.lower() for col in df.columns]
     
-    # Xử lý date
     date_col = next((c for c in ['date', 'time', 'trading_date'] if c in df.columns), None)
     if date_col and date_col != 'date':
         try:
@@ -125,19 +45,16 @@ def process_dataframe(df):
             
     df = df.sort_values('date')
     
-    # Ensure columns exist and fill NaN
+    # Ensure columns exist
     for col in ['close', 'volume', 'foreign_buy', 'foreign_sell']:
         if col not in df.columns: df[col] = 0.0
     
     df['foreign_buy'] = df['foreign_buy'].fillna(0.0)
     df['foreign_sell'] = df['foreign_sell'].fillna(0.0)
     df['volume'] = df['volume'].fillna(0.0)
-    
     df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
     
-    # Fix đơn vị giá (VNDirect trả về đơn vị gốc, ví dụ 96.5 hoặc 96500)
-    # Thường VNDirect Finfo trả về 96.5 (nghìn đồng) cho close.
-    # Logic: Nếu giá < 500 thì nhân 1000
+    # Fix đơn vị giá
     if not df.empty and df['close'].iloc[-1] < 500:
         for c in ['open', 'high', 'low', 'close']:
             if c in df.columns: df[c] = df[c] * 1000
@@ -145,22 +62,45 @@ def process_dataframe(df):
     return df
 
 def get_data_robust(symbol: str, start_date: str, end_date: str):
-    # CÁCH 1: VNDIRECT DIRECT (Nguồn mới - Hy vọng cao nhất)
-    df_vnd = get_stock_direct_vndirect(symbol, start_date, end_date)
-    if df_vnd is not None and not df_vnd.empty:
-        return process_dataframe(df_vnd), None
-
-    # CÁCH 2: VNSTOCK QUOTE (VCI) - Fallback cuối cùng
+    # CHỈ DÙNG VCI QUOTE (Ổn định nhất trên Render)
+    # Chấp nhận không có lịch sử khối ngoại, sẽ bù đắp bằng Realtime
     try:
-        print("  -> Fallback to Vnstock Quote(VCI)...")
+        print("  -> Fetching Quote(VCI)...")
         quote = Quote(symbol=symbol, source='VCI')
         df = quote.history(start=start_date, end=end_date, interval='1D')
         if df is not None:
-            return process_dataframe(df), "Dữ liệu dự phòng từ VCI (Mất khối ngoại)."
-    except:
+            return process_dataframe(df), "Dữ liệu từ VCI (Đã bù khối ngoại hôm nay)."
+    except Exception as e:
+        print(f"Quote Error: {e}")
         pass
 
     return None, "Không lấy được dữ liệu."
+
+def get_realtime_foreign(symbol: str):
+    """Lấy dữ liệu khối ngoại hôm nay từ bảng giá VCI"""
+    try:
+        trading = Trading(source='VCI')
+        df = trading.price_board([symbol])
+        if df is not None and not df.empty:
+            row = df.iloc[0]
+            # Lấy các cột khối ngoại (tên cột có thể thay đổi tùy version vnstock)
+            # Thường là: foreign_buy_volume, foreign_sell_volume
+            f_buy = float(row.get('foreign_buy_volume', row.get('foreign_buy_vol', 0)))
+            f_sell = float(row.get('foreign_sell_volume', row.get('foreign_sell_vol', 0)))
+            
+            # Lấy thêm giá/vol hiện tại để update nến hôm nay luôn
+            close = float(row.get('match_price', row.get('close', 0)))
+            vol = float(row.get('total_volume', row.get('volume', 0)))
+            
+            return {
+                "foreign_buy": f_buy,
+                "foreign_sell": f_sell,
+                "close": close,
+                "volume": vol
+            }
+    except Exception as e:
+        print(f"Realtime Fetch Error: {e}")
+    return None
 
 # --- API ENDPOINTS ---
 @app.get("/api/stock/{symbol}")
@@ -169,7 +109,6 @@ def get_stock(symbol: str):
         symbol = symbol.upper()
         current_time = time.time()
         
-        # Cache Check
         if symbol in STOCK_CACHE:
             if current_time - STOCK_CACHE[symbol]['timestamp'] < CACHE_DURATION:
                 return STOCK_CACHE[symbol]['data']
@@ -181,7 +120,37 @@ def get_stock(symbol: str):
         
         if df is None: return {"error": warning}
 
-        # Shark Logic & Calculations
+        # --- GHÉP DỮ LIỆU REALTIME (QUAN TRỌNG) ---
+        # Lấy thông tin phiên hôm nay để điền vào khối ngoại
+        rt_data = get_realtime_foreign(symbol)
+        if rt_data:
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            last_date_in_df = df['date'].iloc[-1]
+            
+            # Nếu dòng cuối cùng là hôm nay -> Update
+            if last_date_in_df == today_str:
+                idx = df.index[-1]
+                df.at[idx, 'foreign_buy'] = rt_data['foreign_buy']
+                df.at[idx, 'foreign_sell'] = rt_data['foreign_sell']
+                df.at[idx, 'foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
+                # Update cả giá và vol cho khớp realtime
+                if rt_data['close'] > 0: df.at[idx, 'close'] = rt_data['close']
+                if rt_data['volume'] > 0: df.at[idx, 'volume'] = rt_data['volume']
+                
+            # Nếu dòng cuối cũ hơn hôm nay -> Thêm dòng mới (trường hợp đầu phiên)
+            elif last_date_in_df < today_str:
+                new_row = df.iloc[-1].copy()
+                new_row['date'] = today_str
+                new_row['foreign_buy'] = rt_data['foreign_buy']
+                new_row['foreign_sell'] = rt_data['foreign_sell']
+                new_row['foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
+                if rt_data['close'] > 0: new_row['close'] = rt_data['close']
+                if rt_data['volume'] > 0: new_row['volume'] = rt_data['volume']
+                
+                # Append dòng mới
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+        # Tính toán chỉ số
         df['volume'] = df['volume'].astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
@@ -206,17 +175,12 @@ def get_stock(symbol: str):
         
         if IS_VOL_SPIKE:
             if IS_PRICE_UP:
-                if IS_FOREIGN_BUY: 
-                    shark_action, shark_color = "Gom hàng mạnh (Uy tín)", "strong_buy"
-                elif IS_FOREIGN_SELL: 
-                    shark_action, shark_color = "Coi chừng Kéo Xả (FOMO)", "warning"
-                else: 
-                    shark_action, shark_color = "Dòng tiền đầu cơ nóng", "buy"
+                if IS_FOREIGN_BUY: shark_action, shark_color = "Gom hàng mạnh (Uy tín)", "strong_buy"
+                elif IS_FOREIGN_SELL: shark_action, shark_color = "Coi chừng Kéo Xả (FOMO)", "warning"
+                else: shark_action, shark_color = "Dòng tiền đầu cơ nóng", "buy"
             elif IS_PRICE_DOWN:
-                if IS_FOREIGN_BUY: 
-                    shark_action, shark_color = "Đè gom (Hoảng loạn)", "buy"
-                else: 
-                    shark_action, shark_color = "Xả hàng mạnh", "strong_sell"
+                if IS_FOREIGN_BUY: shark_action, shark_color = "Đè gom (Hoảng loạn)", "buy"
+                else: shark_action, shark_color = "Xả hàng mạnh", "strong_sell"
             else:
                 shark_action = "Biến động mạnh"
 
