@@ -2,6 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import vnstock as vnstock_lib
 from vnstock import Quote, Trading, config
+try:
+    from vnstock import market_top_mover
+except ImportError:
+    market_top_mover = None
+
 import pandas as pd
 from datetime import datetime, timedelta
 import urllib.parse
@@ -29,7 +34,7 @@ CACHE_DURATION = 300 # 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API Final (Smart Volume Match v2)"}
+    return {"message": "Stock API Final (Weekend Fix - Smart Volume Match)"}
 
 # --- 1. XỬ LÝ DATAFRAME ---
 def process_dataframe(df):
@@ -119,7 +124,6 @@ def get_stock(symbol: str):
         if df is None: return {"error": "Không lấy được dữ liệu lịch sử"}
 
         # B. SMART PATCH (VÁ LỖI BẰNG REALTIME)
-        # Bước này sẽ điền số liệu khối ngoại vào dòng cuối cùng
         rt_data = get_realtime_data(symbol)
         
         if rt_data:
@@ -128,32 +132,31 @@ def get_stock(symbol: str):
             last_date = df['date'].iloc[-1]
             last_vol = float(df['volume'].iloc[-1])
             
-            # LOGIC SO KHỚP:
-            # 1. Nếu cùng ngày -> Update
-            # 2. Nếu khác ngày nhưng Volume khớp (lệch < 5%) -> Update (Do bảng điện chưa sang ngày mới)
-            
-            is_same_day = (last_date == today_str)
+            # --- LOGIC QUAN TRỌNG: SO KHỚP VOLUME ---
+            # Bất kể ngày tháng, nếu Volume khớp nhau -> Update khối ngoại
             is_volume_match = False
             
             if last_vol > 0:
+                # Tính độ lệch Volume (Cho phép lệch 5%)
                 diff_pct = abs(rt_data['volume'] - last_vol) / last_vol
                 if diff_pct < 0.05: 
                     is_volume_match = True
 
-            if is_same_day or is_volume_match:
-                # Cập nhật khối ngoại vào dòng lịch sử cuối cùng
+            # NẾU KHỚP VOLUME HOẶC TRÙNG NGÀY -> UPDATE
+            if is_volume_match or (last_date == today_str):
                 df.at[last_idx, 'foreign_buy'] = rt_data['foreign_buy']
                 df.at[last_idx, 'foreign_sell'] = rt_data['foreign_sell']
                 df.at[last_idx, 'foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
                 
-                # Cập nhật giá đóng cửa chuẩn từ realtime
+                # Cập nhật giá close chuẩn từ realtime
                 if rt_data['close'] > 0: df.at[last_idx, 'close'] = rt_data['close']
                 if rt_data['volume'] > 0: df.at[last_idx, 'volume'] = rt_data['volume']
                 
-                warning = f"Dữ liệu khối ngoại được đồng bộ từ Realtime (Match: {'Day' if is_same_day else 'Vol'})."
+                warning = f"Dữ liệu khối ngoại được đồng bộ (Match Vol: {is_volume_match})."
                 
             elif last_date < today_str and rt_data['volume'] > 0:
-                # Ngày mới -> Thêm dòng mới
+                # Nếu ngày khác VÀ Volume khác hẳn -> Có thể là phiên mới
+                # (Logic này chỉ chạy khi vào phiên thứ 2 tuần sau)
                 new_row = df.iloc[-1].copy()
                 new_row['date'] = today_str
                 new_row['close'] = rt_data['close']
@@ -161,7 +164,6 @@ def get_stock(symbol: str):
                 new_row['foreign_buy'] = rt_data['foreign_buy']
                 new_row['foreign_sell'] = rt_data['foreign_sell']
                 new_row['foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
-                # Tạm lấy giá close làm OHL
                 new_row['open'] = rt_data['close']
                 new_row['high'] = rt_data['close']
                 new_row['low'] = rt_data['close']
