@@ -89,7 +89,7 @@ def get_realtime_data(symbol: str):
         print(f"Realtime Error: {e}")
     return None
 
-# --- 2. API ENDPOINTS ---
+# --- CẬP NHẬT HÀM GET_STOCK (SMART MATCHING) ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
@@ -104,7 +104,7 @@ def get_stock(symbol: str):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
         
-        # A. LẤY LỊCH SỬ
+        # A. LẤY LỊCH SỬ (VCI Quote)
         df = None
         warning = None
         try:
@@ -117,7 +117,7 @@ def get_stock(symbol: str):
 
         if df is None: return {"error": "Không lấy được dữ liệu lịch sử"}
 
-        # B. SMART PATCH (VÁ LỖI THÔNG MINH)
+        # B. SMART PATCH (VÁ LỖI THÔNG MINH CHO CUỐI TUẦN)
         rt_data = get_realtime_data(symbol)
         
         if rt_data:
@@ -128,34 +128,31 @@ def get_stock(symbol: str):
             
             # --- LOGIC MỚI: SO KHỚP VOLUME ---
             # Nếu Volume Realtime sấp sỉ Volume Lịch sử (chênh lệch < 1%) 
-            # -> Chứng tỏ Bảng điện vẫn đang hiển thị dữ liệu của ngày giao dịch cuối cùng (Thứ 6)
-            # -> Cập nhật Khối ngoại vào dòng đó.
+            # -> Chứng tỏ Bảng điện vẫn đang lưu dữ liệu của ngày giao dịch cuối cùng (Thứ 6)
+            # -> Cập nhật Khối ngoại vào dòng đó bất kể ngày tháng.
             
             is_same_day = (last_date == today_str)
             is_volume_match = False
             
             if last_vol > 0:
                 diff_pct = abs(rt_data['volume'] - last_vol) / last_vol
-                if diff_pct < 0.05: # Chấp nhận lệch 5% (do data realtime có thể cập nhật chậm hơn chút)
+                if diff_pct < 0.05: # Chấp nhận lệch 5% (do data realtime/history có thể lệch nhẹ)
                     is_volume_match = True
 
             # QUYẾT ĐỊNH UPDATE
             if is_same_day or is_volume_match:
-                # Update vào dòng cuối cùng
+                # Update vào dòng cuối cùng (VD: Ngày 16/01)
                 df.at[last_idx, 'foreign_buy'] = rt_data['foreign_buy']
                 df.at[last_idx, 'foreign_sell'] = rt_data['foreign_sell']
                 df.at[last_idx, 'foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
                 
                 # Ưu tiên lấy giá đóng cửa từ Realtime vì nó chính xác hơn Quote đôi khi
                 if rt_data['close'] > 0: df.at[last_idx, 'close'] = rt_data['close']
-                if rt_data['volume'] > 0: df.at[last_idx, 'volume'] = rt_data['volume']
                 
                 warning = f"Dữ liệu khối ngoại được đồng bộ từ Realtime (Match: {'Day' if is_same_day else 'Vol'})."
                 
             elif last_date < today_str and rt_data['volume'] > 0:
-                # Nếu ngày khác nhau VÀ Volume khác nhau hoàn toàn 
-                # -> Có thể là ngày giao dịch mới (VD: Sáng thứ 2)
-                # -> Thêm dòng mới
+                # Nếu ngày khác nhau VÀ Volume khác nhau hoàn toàn -> Ngày mới
                 new_row = df.iloc[-1].copy()
                 new_row['date'] = today_str
                 new_row['close'] = rt_data['close']
@@ -224,7 +221,7 @@ def get_stock(symbol: str):
 
     except Exception as e:
         return {"error": str(e)}
-
+        
 @app.get("/api/news/{symbol}")
 def get_stock_news(symbol: str):
     try:
@@ -266,3 +263,4 @@ def get_index_data(index_symbol: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
