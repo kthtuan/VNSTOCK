@@ -2,11 +2,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import vnstock as vnstock_lib
 from vnstock import Quote, Trading, config
-try:
-    from vnstock import market_top_mover
-except ImportError:
-    market_top_mover = None
-
 import pandas as pd
 from datetime import datetime, timedelta
 import urllib.parse
@@ -34,9 +29,9 @@ CACHE_DURATION = 300 # 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API Final (Smart Volume Match for Weekend Fix)"}
+    return {"message": "Stock API Final (Smart Volume Match v2)"}
 
-# --- 1. CORE LOGIC ---
+# --- 1. XỬ LÝ DATAFRAME ---
 def process_dataframe(df):
     if df is None or df.empty: return None
     df.columns = [col.lower() for col in df.columns]
@@ -51,7 +46,7 @@ def process_dataframe(df):
             
     df = df.sort_values('date')
     
-    # Fill 0
+    # Đảm bảo có đủ cột và fill 0 ban đầu
     for col in ['close', 'volume', 'foreign_buy', 'foreign_sell']:
         if col not in df.columns: df[col] = 0.0
     
@@ -59,22 +54,28 @@ def process_dataframe(df):
     df['foreign_sell'] = df['foreign_sell'].fillna(0.0)
     df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
     
-    # Fix đơn vị giá
+    # Fix đơn vị giá (VCI trả về nghìn đồng nếu giá < 500)
     if not df.empty and df['close'].iloc[-1] < 500:
         for c in ['open', 'high', 'low', 'close']:
             if c in df.columns: df[c] = df[c] * 1000
             
     return df
 
+# --- 2. HÀM LẤY REALTIME (QUAN TRỌNG) ---
 def get_realtime_data(symbol: str):
-    """Lấy dữ liệu realtime từ VCI"""
+    """Lấy dữ liệu realtime từ VCI để vá lỗi khối ngoại"""
     try:
         trading = Trading(source='VCI')
+        # Lấy bảng giá realtime
         df = trading.price_board([symbol])
+        
         if df is not None and not df.empty:
             row = df.iloc[0]
+            
+            # Mapping cột khối ngoại
             f_buy = float(row.get('foreign_buy_volume', row.get('foreign_buy_vol', row.get('buy_foreign_qtty', 0))))
             f_sell = float(row.get('foreign_sell_volume', row.get('foreign_sell_vol', row.get('sell_foreign_qtty', 0))))
+            
             close = float(row.get('match_price', row.get('close', 0)))
             vol = float(row.get('total_volume', row.get('volume', 0)))
             
@@ -89,7 +90,7 @@ def get_realtime_data(symbol: str):
         print(f"Realtime Error: {e}")
     return None
 
-# --- CẬP NHẬT HÀM GET_STOCK (SMART MATCHING) ---
+# --- 3. API CHÍNH ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
@@ -104,7 +105,7 @@ def get_stock(symbol: str):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
         
-        # A. LẤY LỊCH SỬ (VCI Quote)
+        # A. LẤY LỊCH SỬ (VCI QUOTE - ỔN ĐỊNH)
         df = None
         warning = None
         try:
@@ -117,7 +118,8 @@ def get_stock(symbol: str):
 
         if df is None: return {"error": "Không lấy được dữ liệu lịch sử"}
 
-        # B. SMART PATCH (VÁ LỖI THÔNG MINH CHO CUỐI TUẦN)
+        # B. SMART PATCH (VÁ LỖI BẰNG REALTIME)
+        # Bước này sẽ điền số liệu khối ngoại vào dòng cuối cùng
         rt_data = get_realtime_data(symbol)
         
         if rt_data:
@@ -126,33 +128,32 @@ def get_stock(symbol: str):
             last_date = df['date'].iloc[-1]
             last_vol = float(df['volume'].iloc[-1])
             
-            # --- LOGIC MỚI: SO KHỚP VOLUME ---
-            # Nếu Volume Realtime sấp sỉ Volume Lịch sử (chênh lệch < 1%) 
-            # -> Chứng tỏ Bảng điện vẫn đang lưu dữ liệu của ngày giao dịch cuối cùng (Thứ 6)
-            # -> Cập nhật Khối ngoại vào dòng đó bất kể ngày tháng.
+            # LOGIC SO KHỚP:
+            # 1. Nếu cùng ngày -> Update
+            # 2. Nếu khác ngày nhưng Volume khớp (lệch < 5%) -> Update (Do bảng điện chưa sang ngày mới)
             
             is_same_day = (last_date == today_str)
             is_volume_match = False
             
             if last_vol > 0:
                 diff_pct = abs(rt_data['volume'] - last_vol) / last_vol
-                if diff_pct < 0.05: # Chấp nhận lệch 5% (do data realtime/history có thể lệch nhẹ)
+                if diff_pct < 0.05: 
                     is_volume_match = True
 
-            # QUYẾT ĐỊNH UPDATE
             if is_same_day or is_volume_match:
-                # Update vào dòng cuối cùng (VD: Ngày 16/01)
+                # Cập nhật khối ngoại vào dòng lịch sử cuối cùng
                 df.at[last_idx, 'foreign_buy'] = rt_data['foreign_buy']
                 df.at[last_idx, 'foreign_sell'] = rt_data['foreign_sell']
                 df.at[last_idx, 'foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
                 
-                # Ưu tiên lấy giá đóng cửa từ Realtime vì nó chính xác hơn Quote đôi khi
+                # Cập nhật giá đóng cửa chuẩn từ realtime
                 if rt_data['close'] > 0: df.at[last_idx, 'close'] = rt_data['close']
+                if rt_data['volume'] > 0: df.at[last_idx, 'volume'] = rt_data['volume']
                 
                 warning = f"Dữ liệu khối ngoại được đồng bộ từ Realtime (Match: {'Day' if is_same_day else 'Vol'})."
                 
             elif last_date < today_str and rt_data['volume'] > 0:
-                # Nếu ngày khác nhau VÀ Volume khác nhau hoàn toàn -> Ngày mới
+                # Ngày mới -> Thêm dòng mới
                 new_row = df.iloc[-1].copy()
                 new_row['date'] = today_str
                 new_row['close'] = rt_data['close']
@@ -160,11 +161,15 @@ def get_stock(symbol: str):
                 new_row['foreign_buy'] = rt_data['foreign_buy']
                 new_row['foreign_sell'] = rt_data['foreign_sell']
                 new_row['foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
+                # Tạm lấy giá close làm OHL
+                new_row['open'] = rt_data['close']
+                new_row['high'] = rt_data['close']
+                new_row['low'] = rt_data['close']
                 
                 df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
                 warning = "Đã thêm ngày mới từ Realtime."
 
-        # C. SHARK CALC
+        # C. TÍNH TOÁN SHARK ANALYSIS
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
@@ -176,7 +181,7 @@ def get_stock(symbol: str):
         vol_ratio = last['volume'] / (last['ma20_vol'] if last['ma20_vol'] > 0 else 1)
         price_change = ((last['close'] - prev['close']) / prev['close'] * 100) if prev['close'] > 0 else 0
         
-        # Shark Analysis
+        # Shark Logic
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         
@@ -221,7 +226,7 @@ def get_stock(symbol: str):
 
     except Exception as e:
         return {"error": str(e)}
-        
+
 @app.get("/api/news/{symbol}")
 def get_stock_news(symbol: str):
     try:
@@ -263,4 +268,3 @@ def get_index_data(index_symbol: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
