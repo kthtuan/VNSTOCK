@@ -34,7 +34,7 @@ CACHE_DURATION = 300 # 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API (Price: VCI | Foreign: CafeF Attempt)"}
+    return {"message": "Stock API Final (VCI Quote + Realtime Patch)"}
 
 # --- 1. DATA PROCESSING ---
 def process_dataframe(df):
@@ -51,41 +51,41 @@ def process_dataframe(df):
         pass
             
     df = df.sort_values('date')
+    
+    # Đảm bảo có đủ cột và fill 0
+    for col in ['close', 'volume', 'foreign_buy', 'foreign_sell']:
+        if col not in df.columns: df[col] = 0.0
+    
+    df['foreign_buy'] = df['foreign_buy'].fillna(0.0)
+    df['foreign_sell'] = df['foreign_sell'].fillna(0.0)
+    df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
+    
+    # Fix đơn vị giá (VCI trả về nghìn đồng nếu giá < 500)
+    if not df.empty and df['close'].iloc[-1] < 500:
+        for c in ['open', 'high', 'low', 'close']:
+            if c in df.columns: df[c] = df[c] * 1000
+            
     return df
 
-# --- 2. FOREIGN DATA HELPERS ---
-def get_foreign_cafef(symbol: str, start_date: str, end_date: str):
-    """Thử lấy lịch sử khối ngoại từ nguồn CafeF"""
-    print(f"  -> Trying Foreign Trade from CafeF for {symbol}...")
-    try:
-        # Theo tài liệu bạn cung cấp: CafeF hỗ trợ foreign_trade
-        trading = Trading(source='CafeF') 
-        # Lưu ý: Cú pháp gọi có thể thay đổi tùy version, ta thử cách chuẩn nhất
-        df = trading.foreign_trade(symbol=symbol, start=start_date, end=end_date)
-        
-        if df is not None and not df.empty:
-            df = process_dataframe(df)
-            print(f"    -> CafeF Success: {len(df)} rows found.")
-            return df
-        else:
-            print("    -> CafeF returned empty.")
-    except Exception as e:
-        print(f"    -> CafeF Error: {e}")
-    return None
-
-def get_realtime_vci_backup(symbol: str):
-    """Backup: Lấy dữ liệu realtime từ VCI nếu CafeF thất bại"""
+def get_realtime_data(symbol: str):
+    """Lấy dữ liệu realtime (Giá + Khối ngoại) từ bảng giá VCI"""
     try:
         trading = Trading(source='VCI')
+        # Lấy bảng giá realtime (Hàm này vẫn chạy tốt trên Render)
         df = trading.price_board([symbol])
+        
         if df is not None and not df.empty:
             row = df.iloc[0]
-            # Map cột
+            
+            # Mapping các cột khối ngoại từ Realtime Board
+            # Tên cột có thể thay đổi tùy version vnstock, ta check hết các khả năng
             f_buy = float(row.get('foreign_buy_volume', row.get('foreign_buy_vol', row.get('buy_foreign_qtty', 0))))
             f_sell = float(row.get('foreign_sell_volume', row.get('foreign_sell_vol', row.get('sell_foreign_qtty', 0))))
+            
             close = float(row.get('match_price', row.get('close', 0)))
             vol = float(row.get('total_volume', row.get('volume', 0)))
             
+            # Chỉ trả về khi có dữ liệu giao dịch
             if vol > 0:
                 return {
                     "foreign_buy": f_buy,
@@ -93,107 +93,64 @@ def get_realtime_vci_backup(symbol: str):
                     "close": close,
                     "volume": vol
                 }
-    except:
-        pass
+    except Exception as e:
+        print(f"Realtime Error: {e}")
     return None
 
-# --- 3. MAIN DATA FETCHING ---
-def get_data_hybrid(symbol: str, start_date: str, end_date: str):
-    # A. LẤY GIÁ TỪ VCI (QUOTES) - Nguồn ổn định nhất cho giá
+# --- 2. MAIN DATA FETCHING ---
+def get_stock_data(symbol: str, start_date: str, end_date: str):
+    # A. LẤY GIÁ TỪ VCI (QUOTE)
     try:
         quote = Quote(symbol=symbol, source='VCI')
         df_price = quote.history(start=start_date, end=end_date, interval='1D')
-        df_price = process_dataframe(df_price)
-        
-        if df_price is None or df_price.empty:
-            return None, "Không lấy được dữ liệu giá từ VCI."
-            
-        # Chuẩn hóa giá
-        df_price['close'] = df_price.get('close', 0.0)
-        df_price['volume'] = df_price.get('volume', 0.0)
-        # Fix đơn vị giá < 500
-        if df_price['close'].iloc[-1] < 500:
-            for c in ['open', 'high', 'low', 'close']:
-                if c in df_price.columns: df_price[c] *= 1000
-                
+        df = process_dataframe(df_price)
     except Exception as e:
-        return None, f"Lỗi Quote VCI: {e}"
+        return None, f"Lỗi Quote: {e}"
 
-    # B. LẤY KHỐI NGOẠI TỪ CAFEF (Theo yêu cầu)
-    df_foreign = get_foreign_cafef(symbol, start_date, end_date)
-    
-    # C. MERGE DỮ LIỆU
-    if df_foreign is not None and not df_foreign.empty:
-        # Chuẩn hóa tên cột từ CafeF (CafeF có thể trả về tên cột tiếng Việt hoặc khác)
-        # Ta cố gắng map các từ khóa phổ biến
-        rename_map = {}
-        for col in df_foreign.columns:
-            c_lower = col.lower()
-            if 'buy' in c_lower and 'vol' in c_lower: rename_map[col] = 'foreign_buy'
-            elif 'mua' in c_lower and 'kl' in c_lower: rename_map[col] = 'foreign_buy' # Tiếng Việt
-            elif 'sell' in c_lower and 'vol' in c_lower: rename_map[col] = 'foreign_sell'
-            elif 'ban' in c_lower and 'kl' in c_lower: rename_map[col] = 'foreign_sell' # Tiếng Việt
-            
-        df_foreign = df_foreign.rename(columns=rename_map)
-        
-        # Chỉ merge nếu map được cột
-        if 'foreign_buy' in df_foreign.columns or 'foreign_sell' in df_foreign.columns:
-             # Merge vào bảng giá theo ngày
-             cols_to_merge = ['date']
-             if 'foreign_buy' in df_foreign.columns: cols_to_merge.append('foreign_buy')
-             if 'foreign_sell' in df_foreign.columns: cols_to_merge.append('foreign_sell')
-             
-             df_final = pd.merge(df_price, df_foreign[cols_to_merge], on='date', how='left')
-        else:
-             # Có dữ liệu nhưng không map được cột -> coi như rỗng
-             df_final = df_price.copy()
-             df_final['foreign_buy'] = 0.0
-             df_final['foreign_sell'] = 0.0
-    else:
-        # CafeF thất bại -> Tạo cột rỗng
-        df_final = df_price.copy()
-        df_final['foreign_buy'] = 0.0
-        df_final['foreign_sell'] = 0.0
+    if df is None: return None, "Không lấy được dữ liệu lịch sử."
 
-    # D. BACKUP REALTIME (Nếu hôm nay chưa có dữ liệu)
-    # Bước này để đảm bảo ít nhất hôm nay có số liệu nếu CafeF chưa cập nhật kịp
-    df_final['foreign_buy'] = df_final['foreign_buy'].fillna(0.0)
-    df_final['foreign_sell'] = df_final['foreign_sell'].fillna(0.0)
-    
-    rt_data = get_realtime_vci_backup(symbol)
+    # B. VÁ LỖI BẰNG REALTIME (Quan trọng)
+    # Vì lịch sử Quote không có khối ngoại (do chặn IP hoặc nguồn VCI Quote không có)
+    # Ta lấy khối ngoại hôm nay đắp vào.
+    rt_data = get_realtime_data(symbol)
     warning = None
     
     if rt_data:
         today_str = datetime.now().strftime('%Y-%m-%d')
-        last_date = df_final['date'].iloc[-1]
+        last_date = df['date'].iloc[-1]
         
+        # Trường hợp 1: Dữ liệu lịch sử đã có dòng hôm nay -> Update đè lên
         if last_date == today_str:
-            idx = df_final.index[-1]
-            # Nếu CafeF chưa có số (vẫn là 0) thì đắp Realtime vào
-            if df_final.at[idx, 'foreign_buy'] == 0 and df_final.at[idx, 'foreign_sell'] == 0:
-                df_final.at[idx, 'foreign_buy'] = rt_data['foreign_buy']
-                df_final.at[idx, 'foreign_sell'] = rt_data['foreign_sell']
-                warning = "Dữ liệu khối ngoại hôm nay lấy từ VCI Realtime (Backup)."
-            # Luôn update giá realtime mới nhất
-            if rt_data['close'] > 0: df_final.at[idx, 'close'] = rt_data['close']
-            if rt_data['volume'] > 0: df_final.at[idx, 'volume'] = rt_data['volume']
+            idx = df.index[-1]
+            df.at[idx, 'foreign_buy'] = rt_data['foreign_buy']
+            df.at[idx, 'foreign_sell'] = rt_data['foreign_sell']
+            df.at[idx, 'foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
             
+            # Cập nhật giá/vol mới nhất từ bảng điện
+            if rt_data['close'] > 0: df.at[idx, 'close'] = rt_data['close']
+            if rt_data['volume'] > 0: df.at[idx, 'volume'] = rt_data['volume']
+            
+            warning = "Dữ liệu hôm nay được cập nhật từ Bảng điện (Realtime)."
+            
+        # Trường hợp 2: Lịch sử chưa cập nhật ngày hôm nay -> Thêm dòng mới
         elif last_date < today_str:
-            # Thêm dòng mới cho hôm nay
-            new_row = df_final.iloc[-1].copy()
+            new_row = df.iloc[-1].copy()
             new_row['date'] = today_str
             new_row['close'] = rt_data['close']
             new_row['volume'] = rt_data['volume']
             new_row['foreign_buy'] = rt_data['foreign_buy']
             new_row['foreign_sell'] = rt_data['foreign_sell']
+            new_row['foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
+            
+            # Các cột OHL tạm lấy bằng giá Close realtime
             new_row['open'] = rt_data['close']
             new_row['high'] = rt_data['close']
             new_row['low'] = rt_data['close']
             
-            df_final = pd.concat([df_final, pd.DataFrame([new_row])], ignore_index=True)
-            warning = "Đã bổ sung dữ liệu realtime hôm nay."
-
-    return df_final, warning
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            warning = "Đã bổ sung dữ liệu ngày hôm nay từ Realtime."
+            
+    return df, warning
 
 # --- API ENDPOINTS ---
 @app.get("/api/stock/{symbol}")
@@ -202,6 +159,7 @@ def get_stock(symbol: str):
         symbol = symbol.upper()
         current_time = time.time()
         
+        # Check Cache
         if symbol in STOCK_CACHE:
             if current_time - STOCK_CACHE[symbol]['timestamp'] < CACHE_DURATION:
                 return STOCK_CACHE[symbol]['data']
@@ -209,13 +167,12 @@ def get_stock(symbol: str):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
         
-        # GỌI HÀM HYBRID
-        df, warning = get_data_hybrid(symbol, start_date, end_date)
+        # GỌI HÀM
+        df, warning = get_stock_data(symbol, start_date, end_date)
         
         if df is None: return {"error": warning}
 
         # --- TÍNH TOÁN SHARK ---
-        df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
@@ -227,7 +184,7 @@ def get_stock(symbol: str):
         vol_ratio = last['volume'] / (last['ma20_vol'] if last['ma20_vol'] > 0 else 1)
         price_change = ((last['close'] - prev['close']) / prev['close'] * 100) if prev['close'] > 0 else 0
         
-        # Shark Logic V2
+        # Shark Analysis Logic V2
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         
