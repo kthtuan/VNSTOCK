@@ -33,14 +33,14 @@ CACHE_DURATION = 300 # Cache 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API (VCI New Foreign Trade Function)"}
+    return {"message": "Stock API Final (VCI Quote + Realtime Patch)"}
 
 # --- 1. CORE LOGIC ---
 def process_dataframe(df):
     if df is None or df.empty: return None
     df.columns = [col.lower() for col in df.columns]
     
-    # Xử lý cột ngày (có thể là time, trading_date, date)
+    # Xử lý cột ngày
     date_col = next((c for c in ['time', 'trading_date', 'date', 'ngay'] if c in df.columns), None)
     if not date_col: return None
     
@@ -50,97 +50,47 @@ def process_dataframe(df):
         pass
             
     df = df.sort_values('date')
+    
+    # Đảm bảo có đủ cột
+    for col in ['close', 'volume', 'foreign_buy', 'foreign_sell']:
+        if col not in df.columns: df[col] = 0.0
+        
+    df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
+    
+    # Fix đơn vị giá (VCI trả về nghìn đồng nếu giá < 500)
+    if not df.empty and df['close'].iloc[-1] < 500:
+        for c in ['open', 'high', 'low', 'close']:
+            if c in df.columns: df[c] = df[c] * 1000
+            
     return df
 
-def get_data_vci_new(symbol: str, start_date: str, end_date: str):
-    """
-    Chiến thuật mới:
-    1. Lấy lịch sử giá (Quote)
-    2. Lấy lịch sử khối ngoại (Trading.foreign_trade) - Hàm mới!
-    3. Merge lại với nhau
-    """
-    print(f"Fetching {symbol} VCI New Method...")
-    
-    # BƯỚC 1: LẤY GIÁ (QUOTE)
-    try:
-        quote = Quote(symbol=symbol, source='VCI')
-        df_price = quote.history(start=start_date, end=end_date, interval='1D')
-        df_price = process_dataframe(df_price)
-        
-        if df_price is None or df_price.empty:
-            return None, "Không lấy được dữ liệu giá."
-            
-        # Chuẩn hóa cột giá
-        df_price['close'] = df_price.get('close', 0.0)
-        df_price['volume'] = df_price.get('volume', 0.0)
-        # Fix đơn vị giá
-        if df_price['close'].iloc[-1] < 500:
-            for c in ['open', 'high', 'low', 'close']:
-                if c in df_price.columns: df_price[c] *= 1000
-                
-    except Exception as e:
-        print(f"Quote Error: {e}")
-        return None, f"Lỗi lấy giá: {e}"
-
-    # BƯỚC 2: LẤY KHỐI NGOẠI (HÀM MỚI foreign_trade)
+def get_realtime_data(symbol: str):
+    """Lấy dữ liệu realtime (Giá + Khối ngoại) từ bảng giá VCI"""
     try:
         trading = Trading(source='VCI')
-        # Lưu ý: Hàm foreign_trade() có thể không cần tham số hoặc cần symbol tùy version
-        # Ta thử gọi an toàn
-        try:
-            # Cách gọi mới cho Trading VCI thường là khởi tạo Trading(symbol=...)
-            trading_symbol = Trading(symbol=symbol, source='VCI')
-            df_foreign = trading_symbol.foreign_trade() 
-        except:
-            # Fallback cách cũ
-            df_foreign = trading.foreign_trade(symbol=symbol)
+        df = trading.price_board([symbol])
+        if df is not None and not df.empty:
+            row = df.iloc[0]
             
-        df_foreign = process_dataframe(df_foreign)
-        
-        if df_foreign is not None and not df_foreign.empty:
-            print(f"  -> Found Foreign Data: {len(df_foreign)} rows")
-            # Map cột khối ngoại (tên cột có thể là buy_volume, sell_volume...)
-            # Kiểm tra tên cột thực tế trả về để map
+            # Mapping các cột khối ngoại từ Realtime Board
+            # Tên cột có thể thay đổi tùy version, ta check hết
+            f_buy = float(row.get('foreign_buy_volume', row.get('foreign_buy_vol', row.get('buy_foreign_qtty', 0))))
+            f_sell = float(row.get('foreign_sell_volume', row.get('foreign_sell_vol', row.get('sell_foreign_qtty', 0))))
             
-            # Giả định tên cột trả về từ foreign_trade
-            # Thường là: date, buy_volume, sell_volume, buy_value, sell_value
+            close = float(row.get('match_price', row.get('close', 0)))
+            vol = float(row.get('total_volume', row.get('volume', 0)))
             
-            # Đổi tên để merge
-            rename_map = {}
-            for c in df_foreign.columns:
-                if 'buy' in c and 'vol' in c: rename_map[c] = 'foreign_buy'
-                if 'sell' in c and 'vol' in c: rename_map[c] = 'foreign_sell'
-            
-            df_foreign = df_foreign.rename(columns=rename_map)
-            
-            # Chỉ giữ lại các cột cần thiết để merge
-            cols_to_merge = ['date']
-            if 'foreign_buy' in df_foreign.columns: cols_to_merge.append('foreign_buy')
-            if 'foreign_sell' in df_foreign.columns: cols_to_merge.append('foreign_sell')
-            
-            df_foreign = df_foreign[cols_to_merge]
-            
-            # MERGE: Left join vào bảng giá
-            df_final = pd.merge(df_price, df_foreign, on='date', how='left')
-            
-            # Fill NaN bằng 0
-            df_final['foreign_buy'] = df_final['foreign_buy'].fillna(0.0)
-            df_final['foreign_sell'] = df_final['foreign_sell'].fillna(0.0)
-            
-            return df_final, None
-        else:
-            print("  -> No Foreign Data returned.")
-            # Vẫn trả về bảng giá dù không có khối ngoại
-            df_price['foreign_buy'] = 0.0
-            df_price['foreign_sell'] = 0.0
-            return df_price, "Không lấy được khối ngoại (Hàm mới trả về rỗng)."
-            
+            # Nếu đang trong phiên (có khớp lệnh)
+            if vol > 0:
+                return {
+                    "foreign_buy": f_buy,
+                    "foreign_sell": f_sell,
+                    "close": close,
+                    "volume": vol
+                }
     except Exception as e:
-        print(f"Foreign Trade Error: {e}")
-        # Vẫn trả về giá
-        df_price['foreign_buy'] = 0.0
-        df_price['foreign_sell'] = 0.0
-        return df_price, f"Lỗi lấy khối ngoại: {str(e)}"
+        print(f"Realtime Error: {e}")
+    return None
 
 # --- 2. API ENDPOINTS ---
 @app.get("/api/stock/{symbol}")
@@ -149,6 +99,7 @@ def get_stock(symbol: str):
         symbol = symbol.upper()
         current_time = time.time()
         
+        # Check Cache
         if symbol in STOCK_CACHE:
             if current_time - STOCK_CACHE[symbol]['timestamp'] < CACHE_DURATION:
                 return STOCK_CACHE[symbol]['data']
@@ -156,18 +107,51 @@ def get_stock(symbol: str):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
         
-        # GỌI HÀM MỚI
-        df, warning = get_data_vci_new(symbol, start_date, end_date)
+        # --- BƯỚC 1: LẤY LỊCH SỬ GIÁ (QUOTE VCI - ỔN ĐỊNH NHẤT) ---
+        df = None
+        warning = None
+        try:
+            quote = Quote(symbol=symbol, source='VCI')
+            raw_df = quote.history(start=start_date, end=end_date, interval='1D')
+            if raw_df is not None:
+                df = process_dataframe(raw_df)
+        except Exception as e:
+            return {"error": f"Quote Error: {e}"}
+
+        if df is None: return {"error": "Không lấy được dữ liệu lịch sử"}
+
+        # --- BƯỚC 2: VÁ LỖI BẰNG REALTIME (REALTIME PATCH) ---
+        # Vì lịch sử Quote không có khối ngoại, ta lấy từ realtime đắp vào ngày hôm nay
+        rt_data = get_realtime_data(symbol)
         
-        if df is None: return {"error": warning}
+        if rt_data:
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            last_date = df['date'].iloc[-1]
+            
+            # Nếu dữ liệu lịch sử đã có ngày hôm nay -> Update
+            if last_date == today_str:
+                idx = df.index[-1]
+                df.at[idx, 'foreign_buy'] = rt_data['foreign_buy']
+                df.at[idx, 'foreign_sell'] = rt_data['foreign_sell']
+                df.at[idx, 'foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
+                # Cập nhật giá/vol mới nhất từ bảng điện
+                if rt_data['close'] > 0: df.at[idx, 'close'] = rt_data['close']
+                if rt_data['volume'] > 0: df.at[idx, 'volume'] = rt_data['volume']
+                warning = "Dữ liệu được cập nhật từ Bảng điện (Realtime)."
+                
+            # Nếu lịch sử chưa cập nhật ngày hôm nay -> Thêm dòng mới
+            elif last_date < today_str:
+                new_row = df.iloc[-1].copy()
+                new_row['date'] = today_str
+                new_row['close'] = rt_data['close']
+                new_row['volume'] = rt_data['volume']
+                new_row['foreign_buy'] = rt_data['foreign_buy']
+                new_row['foreign_sell'] = rt_data['foreign_sell']
+                new_row['foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                warning = "Đã thêm dữ liệu ngày hôm nay từ Realtime."
 
         # --- BƯỚC 3: TÍNH TOÁN SHARK ---
-        # Đảm bảo các cột tồn tại
-        if 'foreign_buy' not in df.columns: df['foreign_buy'] = 0.0
-        if 'foreign_sell' not in df.columns: df['foreign_sell'] = 0.0
-        
-        df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
-        
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
@@ -179,7 +163,7 @@ def get_stock(symbol: str):
         vol_ratio = last['volume'] / (last['ma20_vol'] if last['ma20_vol'] > 0 else 1)
         price_change = ((last['close'] - prev['close']) / prev['close'] * 100) if prev['close'] > 0 else 0
         
-        # Shark Logic V2
+        # Shark Analysis Logic V2
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         
@@ -254,17 +238,14 @@ def get_top_mover(filter: str = 'ForeignTrading', limit: int = 10):
 @app.get("/api/index/{index_symbol}")
 def get_index_data(index_symbol: str):
     try:
-        index_symbol = index_symbol.upper()
-        # Dùng hàm mới lấy giá cho index luôn
-        quote = Quote(symbol=index_symbol, source='VCI')
+        quote = Quote(symbol=index_symbol.upper(), source='VCI')
         df = quote.history(start=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'), 
                            end=datetime.now().strftime('%Y-%m-%d'), interval='1D')
-        df = process_dataframe(df)
         if df is not None:
+             df = process_dataframe(df)
              return df.to_dict(orient='records')
-        return {"error": "Không lấy được dữ liệu chỉ số"}
-    except Exception as e:
-        return {"error": str(e)}
+        return {"error": "No Data"}
+    except Exception as e: return {"error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
