@@ -34,7 +34,7 @@ CACHE_DURATION = 300 # 5 phút
 
 @app.get("/")
 def home():
-    return {"message": "Stock API Final (Weekend Fix - Smart Volume Match)"}
+    return {"message": "Stock API Final (Multi-Source History + Smart Patch)"}
 
 # --- 1. XỬ LÝ DATAFRAME ---
 def process_dataframe(df):
@@ -60,27 +60,63 @@ def process_dataframe(df):
     df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
     
     # Fix đơn vị giá (VCI trả về nghìn đồng nếu giá < 500)
+    # Lưu ý: TCBS thường trả về đúng đơn vị (nghìn), nên cần check kỹ
     if not df.empty and df['close'].iloc[-1] < 500:
         for c in ['open', 'high', 'low', 'close']:
             if c in df.columns: df[c] = df[c] * 1000
             
     return df
 
-# --- 2. HÀM LẤY REALTIME (QUAN TRỌNG) ---
+# --- 2. CHIẾN THUẬT LẤY LỊCH SỬ ĐA NGUỒN ---
+def get_history_multi_source(symbol: str, start_date: str, end_date: str):
+    # ƯU TIÊN 1: TCBS (Có dữ liệu khối ngoại tốt nhất)
+    # - TCBS là nguồn mặc định phổ biến
+    try:
+        print(f"Fetching history for {symbol} from TCBS...")
+        quote = Quote(symbol=symbol, source='TCBS')
+        raw_df = quote.history(start=start_date, end=end_date, interval='1D')
+        
+        if raw_df is not None and not raw_df.empty:
+            df = process_dataframe(raw_df)
+            # Kiểm tra xem có dữ liệu khối ngoại thực sự không
+            if df['foreign_buy'].sum() > 0 or df['foreign_sell'].sum() > 0:
+                print("-> TCBS Success (With Foreign Data)")
+                return df, None
+            else:
+                print("-> TCBS OK but No Foreign Data (Might be 0)")
+                # Vẫn trả về nếu có giá, nhưng log lại
+                return df, None
+    except Exception as e:
+        print(f"-> TCBS Failed: {e}")
+
+    # ƯU TIÊN 2: VCI (Fallback - Chắc chắn có Giá, nhưng Khối ngoại = 0)
+    # - VCI hỗ trợ Quote history
+    try:
+        print(f"Fetching history for {symbol} from VCI (Fallback)...")
+        quote = Quote(symbol=symbol, source='VCI')
+        raw_df = quote.history(start=start_date, end=end_date, interval='1D')
+        
+        if raw_df is not None:
+            df = process_dataframe(raw_df)
+            return df, "Dữ liệu lịch sử từ VCI (Không có Khối ngoại quá khứ)."
+    except Exception as e:
+        print(f"-> VCI Failed: {e}")
+
+    return None, "Không lấy được dữ liệu lịch sử từ cả TCBS và VCI."
+
+# --- 3. HÀM LẤY REALTIME (VÁ LỖI HÔM NAY) ---
 def get_realtime_data(symbol: str):
-    """Lấy dữ liệu realtime từ VCI để vá lỗi khối ngoại"""
+    """Lấy dữ liệu realtime từ VCI"""
     try:
         trading = Trading(source='VCI')
-        # Lấy bảng giá realtime
+        # - VCI price_board OK
         df = trading.price_board([symbol])
         
         if df is not None and not df.empty:
             row = df.iloc[0]
             
-            # Mapping cột khối ngoại
             f_buy = float(row.get('foreign_buy_volume', row.get('foreign_buy_vol', row.get('buy_foreign_qtty', 0))))
             f_sell = float(row.get('foreign_sell_volume', row.get('foreign_sell_vol', row.get('sell_foreign_qtty', 0))))
-            
             close = float(row.get('match_price', row.get('close', 0)))
             vol = float(row.get('total_volume', row.get('volume', 0)))
             
@@ -95,14 +131,13 @@ def get_realtime_data(symbol: str):
         print(f"Realtime Error: {e}")
     return None
 
-# --- 3. API CHÍNH ---
+# --- 4. API CHÍNH ---
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str):
     try:
         symbol = symbol.upper()
         current_time = time.time()
         
-        # Check Cache
         if symbol in STOCK_CACHE:
             if current_time - STOCK_CACHE[symbol]['timestamp'] < CACHE_DURATION:
                 return STOCK_CACHE[symbol]['data']
@@ -110,18 +145,9 @@ def get_stock(symbol: str):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
         
-        # A. LẤY LỊCH SỬ (VCI QUOTE - ỔN ĐỊNH)
-        df = None
-        warning = None
-        try:
-            quote = Quote(symbol=symbol, source='VCI')
-            raw_df = quote.history(start=start_date, end=end_date, interval='1D')
-            if raw_df is not None:
-                df = process_dataframe(raw_df)
-        except Exception as e:
-            return {"error": f"Quote Error: {e}"}
-
-        if df is None: return {"error": "Không lấy được dữ liệu lịch sử"}
+        # A. LẤY LỊCH SỬ (ĐA NGUỒN)
+        df, warning = get_history_multi_source(symbol, start_date, end_date)
+        if df is None: return {"error": warning}
 
         # B. SMART PATCH (VÁ LỖI BẰNG REALTIME)
         rt_data = get_realtime_data(symbol)
@@ -132,31 +158,26 @@ def get_stock(symbol: str):
             last_date = df['date'].iloc[-1]
             last_vol = float(df['volume'].iloc[-1])
             
-            # --- LOGIC QUAN TRỌNG: SO KHỚP VOLUME ---
-            # Bất kể ngày tháng, nếu Volume khớp nhau -> Update khối ngoại
+            # Logic So Khớp Volume
             is_volume_match = False
-            
             if last_vol > 0:
-                # Tính độ lệch Volume (Cho phép lệch 5%)
                 diff_pct = abs(rt_data['volume'] - last_vol) / last_vol
-                if diff_pct < 0.05: 
-                    is_volume_match = True
+                if diff_pct < 0.05: is_volume_match = True
 
-            # NẾU KHỚP VOLUME HOẶC TRÙNG NGÀY -> UPDATE
             if is_volume_match or (last_date == today_str):
+                # Update vào dòng cuối
                 df.at[last_idx, 'foreign_buy'] = rt_data['foreign_buy']
                 df.at[last_idx, 'foreign_sell'] = rt_data['foreign_sell']
                 df.at[last_idx, 'foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
                 
-                # Cập nhật giá close chuẩn từ realtime
                 if rt_data['close'] > 0: df.at[last_idx, 'close'] = rt_data['close']
                 if rt_data['volume'] > 0: df.at[last_idx, 'volume'] = rt_data['volume']
                 
-                warning = f"Dữ liệu khối ngoại được đồng bộ (Match Vol: {is_volume_match})."
+                warning_msg = f"Đồng bộ Realtime (Match Vol: {is_volume_match})"
+                warning = f"{warning} | {warning_msg}" if warning else warning_msg
                 
             elif last_date < today_str and rt_data['volume'] > 0:
-                # Nếu ngày khác VÀ Volume khác hẳn -> Có thể là phiên mới
-                # (Logic này chỉ chạy khi vào phiên thứ 2 tuần sau)
+                # Thêm ngày mới
                 new_row = df.iloc[-1].copy()
                 new_row['date'] = today_str
                 new_row['close'] = rt_data['close']
@@ -169,9 +190,10 @@ def get_stock(symbol: str):
                 new_row['low'] = rt_data['close']
                 
                 df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                warning = "Đã thêm ngày mới từ Realtime."
+                warning_msg = "Thêm ngày mới từ Realtime"
+                warning = f"{warning} | {warning_msg}" if warning else warning_msg
 
-        # C. TÍNH TOÁN SHARK ANALYSIS
+        # C. TÍNH TOÁN
         df['volume'] = df['volume'].fillna(0).astype(float)
         df['ma20_vol'] = df['volume'].rolling(window=20, min_periods=1).mean()
         df['cum_net_5d'] = df['foreign_net'].rolling(window=5, min_periods=1).sum()
@@ -183,7 +205,7 @@ def get_stock(symbol: str):
         vol_ratio = last['volume'] / (last['ma20_vol'] if last['ma20_vol'] > 0 else 1)
         price_change = ((last['close'] - prev['close']) / prev['close'] * 100) if prev['close'] > 0 else 0
         
-        # Shark Logic
+        # Shark Analysis Logic
         shark_action = "Lưỡng lự"
         shark_color = "neutral"
         
