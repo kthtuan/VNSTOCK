@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import urllib.parse
 import numpy as np
 import time
+import feedparser
 
 # --- CONFIG ---
 print("vnstock loaded from:", vnstock_lib.__file__)
@@ -51,10 +52,12 @@ def process_dataframe(df):
             
     df = df.sort_values('date')
     
-    # Đảm bảo có đủ cột
+    # Đảm bảo có đủ cột và fill 0
     for col in ['close', 'volume', 'foreign_buy', 'foreign_sell']:
         if col not in df.columns: df[col] = 0.0
-        
+    
+    df['foreign_buy'] = df['foreign_buy'].fillna(0.0)
+    df['foreign_sell'] = df['foreign_sell'].fillna(0.0)
     df['foreign_net'] = df['foreign_buy'] - df['foreign_sell']
     
     # Fix đơn vị giá (VCI trả về nghìn đồng nếu giá < 500)
@@ -148,6 +151,11 @@ def get_stock(symbol: str):
                 new_row['foreign_buy'] = rt_data['foreign_buy']
                 new_row['foreign_sell'] = rt_data['foreign_sell']
                 new_row['foreign_net'] = rt_data['foreign_buy'] - rt_data['foreign_sell']
+                # Các cột khác tạm lấy từ realtime
+                new_row['open'] = rt_data['close']
+                new_row['high'] = rt_data['close']
+                new_row['low'] = rt_data['close']
+                
                 df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
                 warning = "Đã thêm dữ liệu ngày hôm nay từ Realtime."
 
